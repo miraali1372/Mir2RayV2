@@ -41,6 +41,13 @@ jobs:
       - name: Build web and sync Android
         run: npm run build:android
 
+      - name: Download Android native library
+        run: |
+          mkdir -p android/app/libs
+          curl --fail --location --retry 3 \
+            --output android/app/libs/libv2ray.aar \
+            https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.5.19/libv2ray.aar
+
       - name: Make Gradle wrapper executable
         run: chmod +x android/gradlew
 

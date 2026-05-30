@@ -41,6 +41,9 @@ jobs:
       - name: Build web and sync Android
         run: npm run build:android
 
+      - name: Make Gradle wrapper executable
+        run: chmod +x android/gradlew
+
       - name: Build release APK
         working-directory: android
         run: ./gradlew assembleRelease --no-daemon

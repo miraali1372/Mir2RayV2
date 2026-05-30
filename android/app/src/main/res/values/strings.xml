@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Mir2rayV2</string>
+    <string name="title_activity_main">Mir2rayV2</string>
+    <string name="package_name">com.mir2ray.app</string>
+    <string name="custom_url_scheme">com.mir2ray.app</string>
+</resources>

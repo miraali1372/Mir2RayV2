@@ -1,0 +1,16 @@
+{
+  // Hide "not on the classpath" diagnostics from the Java language server for Android Gradle projects
+  "java.errors.incompleteClasspath.severity": "ignore",
+
+  // Help the Java language server locate Android app sources
+  "java.project.sourcePaths": [
+    "android/app/src/main/java"
+  ],
+
+  // Keep Gradle import enabled (useful if user imports project in the future)
+  "java.import.gradle.enabled": true,
+  "java.configuration.updateBuildConfiguration": "interactive"
+}
+{
+    "java.configuration.updateBuildConfiguration": "automatic"
+}

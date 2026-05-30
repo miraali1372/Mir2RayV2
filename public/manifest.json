@@ -1,0 +1,9 @@
+{
+  "name": "Mir2rayV2",
+  "short_name": "Mir2rayV2",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "description": "Mir2rayV2 V2Ray/Xray Interface"
+}

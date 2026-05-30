@@ -1,0 +1,6 @@
+{
+  "name": "Mir2Ray - Modern V2Ray Client",
+  "description": "A modern graphical UI concept for a V2Ray client with DNS testing, optimized for bypassing censorship.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

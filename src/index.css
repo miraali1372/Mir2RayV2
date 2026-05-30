@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Vazirmatn", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-100;
+  margin: 0;
+  overscroll-behavior-y: none;
+}
+
+/* Mobile Wrapper for Desktop Preview */
+#root {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background-color: #050505;
+}
+
+.mobile-app-container {
+  width: 100%;
+  height: 100%;
+  max-width: 440px; /* Mobile width constraint */
+  background: radial-gradient(circle at top, #111827, #09090b);
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+@media (min-width: 640px) {
+  .mobile-app-container {
+    height: 90vh;
+    border-radius: 2.5rem;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+    border: 8px solid #18181b;
+  }
+}
+
+/* Custom Webkit Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #3f3f46;
+  border-radius: 10px;
+}
+
+.glass-panel {
+  @apply bg-zinc-900/40 backdrop-blur-md border border-zinc-700/50;
+}

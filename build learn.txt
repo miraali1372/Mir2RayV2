@@ -1,0 +1,6 @@
+cd C:\Users\AvangRayan\Desktop\mir2rayV2
+npx vite build
+npx cap sync android
+cd android
+.\gradlew.bat assembleDebug
+

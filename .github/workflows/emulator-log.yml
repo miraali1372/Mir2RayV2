@@ -1,0 +1,68 @@
+name: Android Emulator Log Capture
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
+jobs:
+  emulator-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties') }}
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Start Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          emulator-options: -no-window -no-audio -gpu swiftshader_indirect
+
+      - name: Wait for device
+        run: adb wait-for-device
+
+      - name: Install debug APK
+        run: adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Clear logcat buffer
+        run: adb logcat -c || true
+
+      - name: Launch app (monkey)
+        run: adb shell monkey -p com.mir2ray.app -c android.intent.category.LAUNCHER 1 || true
+
+      - name: Let app run and collect logs
+        run: |
+          sleep 15
+          adb logcat -d -v time > mir2ray_logcat.txt || true
+
+      - name: Upload log artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: mir2ray-logcat
+          path: mir2ray_logcat.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: apk-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk

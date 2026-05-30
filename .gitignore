@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Native Xray lib (download via npm run android:libs)
+android/app/libs/libv2ray.zip
+android/app/libs/libv2ray_extracted/
+android/app/libs/go/
+android/app/libs/libv2ray/
+android/local.properties

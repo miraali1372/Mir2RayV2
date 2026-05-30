@@ -4,3 +4,6 @@ npx cap sync android
 cd android
 .\gradlew.bat assembleDebug
 
+
+git https://github.com/miraali1372/Mir2RayV2.git remove origin
+git remote add origin https://github.com/desmondep/Mir2RayV2.git

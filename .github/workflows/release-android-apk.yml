@@ -61,6 +61,7 @@ jobs:
           tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           name: Mir2rayV2 ${{ github.event.inputs.tag_name || github.ref_name }}
           body_path: RELEASE_NOTES.md
+          overwrite_files: true
           files: android/app/build/outputs/apk/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

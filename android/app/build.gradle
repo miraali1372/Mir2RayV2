@@ -1,8 +1,27 @@
 apply plugin: 'com.android.application'
 
+def releaseKeystoreFile = file('release-keystore.jks')
+def releaseKeystorePassword = System.getenv('MIR2RAY_KEYSTORE_PASSWORD') ?: (project.findProperty('MIR2RAY_KEYSTORE_PASSWORD') ?: 'Mir2RayV2@2026')
+def releaseKeyAlias = System.getenv('MIR2RAY_KEY_ALIAS') ?: (project.findProperty('MIR2RAY_KEY_ALIAS') ?: 'mir2rayv2-release')
+def releaseKeyPassword = System.getenv('MIR2RAY_KEY_PASSWORD') ?: (project.findProperty('MIR2RAY_KEY_PASSWORD') ?: releaseKeystorePassword)
+
+if (!releaseKeystoreFile.exists()) {
+    throw new GradleException("Missing release keystore: ${releaseKeystoreFile}")
+}
+
 android {
     namespace = "com.mir2ray.app"
     compileSdk = rootProject.ext.compileSdkVersion
+
+    signingConfigs {
+        release {
+            storeFile releaseKeystoreFile
+            storePassword releaseKeystorePassword
+            keyAlias releaseKeyAlias
+            keyPassword releaseKeyPassword
+        }
+    }
+
     defaultConfig {
         applicationId "com.mir2ray.app"
         minSdkVersion rootProject.ext.minSdkVersion
@@ -19,6 +38,7 @@ android {
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }

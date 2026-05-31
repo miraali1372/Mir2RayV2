@@ -4,7 +4,7 @@ import { Power, ShieldCheck, Activity, Globe, Network, ArrowDownToLine, ArrowUpF
 import { QRCodeCanvas } from 'qrcode.react';
 import { V2RayConfig, DnsServer } from '../types';
 import { generateExportUri } from '../utils';
-import { buildVpnStartPayload, serializeVpnPayload } from '../utils/vpnPayload';
+import { buildVpnStartPayload } from '../utils/vpnPayload';
 import { getAppValue, setAppValue } from '../utils/appStorage';
 // Use Capacitor dynamic Plugins access for runtime permissions
 import { Capacitor } from '@capacitor/core';
@@ -18,6 +18,7 @@ interface DashboardProps {
   setActiveDns: React.Dispatch<React.SetStateAction<DnsServer | null>>;
   isVisible: boolean;
   globalOperation?: boolean;
+  setGlobalOperation?: (val: boolean) => void;
   isConnected: boolean;
   setIsConnected: React.Dispatch<React.SetStateAction<boolean>>;
   isConnecting: boolean;
@@ -26,15 +27,23 @@ interface DashboardProps {
   setUptime: React.Dispatch<React.SetStateAction<number>>;
   lastVpnState: boolean | null;
   lastVpnUpdatedAt: string | null;
+  currentVersion: string;
+  latestVersion: string | null;
+  updateChecking: boolean;
+  updateMessage: string;
+  hasUpdate: boolean;
+  onCheckUpdate: () => void;
 }
 
 export function Dashboard({ 
   activeConfig, activeDns, setConfigs, setActiveDns,
-  isVisible, globalOperation,
+  isVisible, globalOperation, setGlobalOperation,
   isConnected, setIsConnected,
   isConnecting, setIsConnecting,
   uptime, setUptime,
-  lastVpnState, lastVpnUpdatedAt
+  lastVpnState, lastVpnUpdatedAt,
+  currentVersion, latestVersion,
+  updateChecking, updateMessage, hasUpdate, onCheckUpdate
 }: DashboardProps) {
   const [routingMode, setRoutingMode] = useState<'global' | 'apps'>(() => {
     try {
@@ -209,7 +218,7 @@ export function Dashboard({
     };
   }, [isConnected, activeDns?.ip, isVisible, globalOperation]);
 
-  const waitForVpnReady = async (timeoutMs = 6000) => {
+  const waitForVpnReady = async (timeoutMs = 12000) => {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
@@ -219,6 +228,12 @@ export function Dashboard({
         // ignore transient errors while service starts
       }
       await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    try {
+      const status = await Xray.getStatus();
+      if (status.running) return;
+    } catch {
+      // use the clear timeout error below
     }
     throw new Error('هسته Xray در مدت زمان مورد انتظار آماده نشد. لطفاً Logcat را بررسی کنید.');
   };
@@ -236,29 +251,27 @@ export function Dashboard({
   };
 
   const handleToggle = async () => {
-    if (!activeConfig) return;
-    
-    if (isConnected) {
-      setIsConnecting(true);
-      try {
-        const { default: Xray } = await import('../plugins/xray');
-        await Xray.stopVpn();
-      } catch (err) {
-        console.error('Failed to stop VPN native plugin', err);
-      }
-      setIsConnecting(false);
-      setIsConnected(false);
-      await persistVpnState(false);
-      return;
-    }
+    if (!activeConfig && !isConnected) return;
 
-    if (activeConfig.type === 'hysteria2') {
+    if (!isConnected && activeConfig?.type === 'hysteria2') {
       alert('Hysteria2 هنوز برای اتصال VPN پشتیبانی نمی‌شود. لطفاً از vless/vmess/trojan استفاده کنید.');
       return;
     }
 
     setIsConnecting(true);
+    setGlobalOperation?.(true);
     try {
+      if (isConnected) {
+        await Xray.stopVpn();
+        setIsConnected(false);
+        await persistVpnState(false);
+        return;
+      }
+
+      if (!activeConfig) {
+        throw new Error('کانفیگ فعالی انتخاب نشده است.');
+      }
+
       // Request notification permission on Android (API 33+)
       if (Capacitor.getPlatform() === 'android') {
         try {
@@ -270,7 +283,6 @@ export function Dashboard({
         }
       }
 
-      const { default: Xray } = await import('../plugins/xray');
       const payload = buildVpnStartPayload(activeConfig, activeDns);
       const allowedApps = allowedAppsText.split('\n').map(s => s.trim()).filter(Boolean);
       const disallowedApps = disallowedAppsText.split('\n').map(s => s.trim()).filter(Boolean);
@@ -292,12 +304,10 @@ export function Dashboard({
 
       await waitForVpnReady();
 
-      setIsConnecting(false);
       setIsConnected(true);
       await persistVpnState(true);
     } catch (err: unknown) {
       console.error('Failed to start VPN via native plugin', err);
-      setIsConnecting(false);
       const msg = err instanceof Error ? err.message : 'اتصال VPN ناموفق بود';
       if (Capacitor.getPlatform() === 'android') {
         alert(msg);
@@ -305,6 +315,9 @@ export function Dashboard({
         // Web preview only — no system VPN
         setTimeout(() => setIsConnected(true), 1500);
       }
+    } finally {
+      setIsConnecting(false);
+      setGlobalOperation?.(false);
     }
   };
 
@@ -356,6 +369,35 @@ export function Dashboard({
           <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`} />
           {isConnected ? 'متصل' : 'قطع شده'}
         </div>
+      </div>
+
+      <div className="w-full glass-panel rounded-2xl mb-4 overflow-hidden">
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-zinc-800/70">
+          <div className="min-w-0 text-right">
+            <div className="text-sm font-medium text-zinc-200">آپدیت نرم‌افزار</div>
+            <div className="text-[11px] text-zinc-500 truncate">
+              نسخه فعلی {currentVersion}
+              {latestVersion ? ` | نسخه جدید ${latestVersion}` : ''}
+            </div>
+          </div>
+          <button
+            onClick={onCheckUpdate}
+            disabled={updateChecking || isConnecting || !!globalOperation}
+            className={`shrink-0 rounded-xl px-3 py-2.5 text-xs font-medium flex items-center gap-2 transition-colors border
+              ${hasUpdate
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-200 hover:bg-cyan-500/15'
+                : 'bg-zinc-800/70 border-zinc-700/70 text-zinc-200 hover:bg-zinc-800'
+              } disabled:opacity-60 disabled:cursor-not-allowed`}
+          >
+            {updateChecking ? <RefreshCw size={14} className="animate-spin" /> : hasUpdate ? <ArrowDownToLine size={14} /> : <RefreshCw size={14} />}
+            <span>{updateChecking ? 'در حال بررسی...' : hasUpdate ? 'دانلود و نصب' : 'بررسی'}</span>
+          </button>
+        </div>
+        {updateMessage && (
+          <div className={`px-4 py-3 text-[11px] leading-5 ${hasUpdate ? 'text-cyan-200' : 'text-zinc-500'}`}>
+            {updateMessage}
+          </div>
+        )}
       </div>
 
       {/* Main Connect Button Area */}

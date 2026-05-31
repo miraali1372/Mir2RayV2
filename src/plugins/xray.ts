@@ -36,6 +36,17 @@ export interface XrayPlugin {
     ok: boolean;
     message?: string;
   }>;
+  measureConfigDownload(options: {
+    config: string;
+    bytes?: number;
+    timeoutMs?: number;
+    downloadUrl?: string;
+  }): Promise<{
+    downloadBps: number;
+    downloadMs: number;
+    ok: boolean;
+    message?: string;
+  }>;
   getTrafficStats(): Promise<{ up: number; down: number }>;
   setSecure(options: { key: string; value: string }): Promise<{ ok: boolean }>;
   getSecure(options: { key: string }): Promise<{ value?: string }>; 
@@ -126,6 +137,19 @@ export class XrayWeb extends WebPlugin implements XrayPlugin {
       uploadBps: -1,
       downloadMs: -1,
       uploadMs: -1,
+      ok: false,
+    };
+  }
+
+  async measureConfigDownload(): Promise<{
+    downloadBps: number;
+    downloadMs: number;
+    ok: boolean;
+    message?: string;
+  }> {
+    return {
+      downloadBps: -1,
+      downloadMs: -1,
       ok: false,
     };
   }

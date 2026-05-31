@@ -236,7 +236,7 @@ export default function App() {
     <div className="mobile-app-container font-sans" dir="rtl">
       
       {/* Dynamic View Injection */}
-      <main className="flex-1 w-full relative overflow-hidden flex flex-col" style={{ paddingBottom: '160px' }}>
+      <main className="flex-1 w-full relative overflow-hidden flex flex-col" style={{ paddingBottom: '112px' }}>
         <div className={currentView === 'dashboard' ? 'block h-full overflow-y-auto' : 'hidden'}>
           <Dashboard 
             activeConfig={activeConfig} 
@@ -245,6 +245,7 @@ export default function App() {
             setActiveDns={setActiveDns}
             isVisible={currentView === 'dashboard'}
             globalOperation={globalOperation}
+            setGlobalOperation={setGlobalOperation}
             isConnected={isConnected}
             setIsConnected={setIsConnected}
             isConnecting={isConnecting}
@@ -253,6 +254,12 @@ export default function App() {
             setUptime={setUptime}
             lastVpnState={lastVpnState}
             lastVpnUpdatedAt={lastVpnUpdatedAt}
+            currentVersion={currentVersion === 'web' ? 'web' : formatVersion(currentVersion)}
+            latestVersion={latestVersion}
+            updateChecking={updateChecking}
+            updateMessage={updateMessage}
+            hasUpdate={hasUpdate}
+            onCheckUpdate={handleCheckUpdate}
           />
         </div>
         <div className={currentView === 'profiles' ? 'block h-full overflow-y-auto' : 'hidden'}>
@@ -280,12 +287,6 @@ export default function App() {
       <Navigation
         currentView={currentView}
         setView={setCurrentView}
-        currentVersion={currentVersion === 'web' ? 'web' : formatVersion(currentVersion)}
-        latestVersion={latestVersion}
-        updateChecking={updateChecking}
-        updateMessage={updateMessage}
-        hasUpdate={hasUpdate}
-        onCheckUpdate={handleCheckUpdate}
       />
       
     </div>

@@ -187,6 +187,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     }
   };
 
+
   const runTrafficTest = async () => {
     if (isSpeedTesting) return;
     if (globalOperation) { alert('یک عملیات در حال اجرا است، لطفاً صبر کنید.'); return; }
@@ -209,6 +210,9 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     setSpeedTestTotal(targets.length);
     setSpeedTestCompleted(0);
 
+    const workerCount = Math.min(3, targets.length);
+    const timeoutMs = 15_000;
+    const bytes = 1_000_000;
     let stateMap = new Map<string, DnsServer>(dnsList.map(d => [d.ip, d]));
     for (const dns of targets) {
       if (stateMap.has(dns.ip)) {
@@ -217,10 +221,15 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     }
     setDnsList(Array.from(stateMap.values()));
 
+    let nextIndex = 0;
     let completed = 0;
-    try {
-      for (const dns of targets) {
+
+    const worker = async () => {
+      while (true) {
         if (abortSpeedRequestedRef.current) break;
+        const index = nextIndex++;
+        if (index >= targets.length) break;
+        const dns = targets[index];
         let downloadBps: number | 'error' = 'error';
         let uploadBps: number | 'error' = 'error';
 
@@ -228,8 +237,8 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
           const payload = {
             ...buildVpnStartPayload(activeConfig, dns),
             strictDns,
-            bytes: 1_000_000,
-            timeoutMs: 15_000,
+            bytes,
+            timeoutMs,
           };
           const result = await Xray.measureConfigBandwidth({
             config: serializeVpnPayload(payload),
@@ -239,8 +248,6 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             uploadBps = result.uploadBps;
           }
         } catch (e) {
-          downloadBps = 'error';
-          uploadBps = 'error';
           console.warn('Bandwidth test failed for DNS', dns.ip, e);
         }
 
@@ -251,8 +258,15 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
         completed += 1;
         setSpeedTestCompleted(completed);
         setDnsList(Array.from(stateMap.values()));
-        await new Promise(resolve => setTimeout(resolve, 0));
+        if (completed % workerCount === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
       }
+    };
+
+    try {
+      const workers = Array.from({ length: workerCount }, () => worker());
+      await Promise.all(workers);
     } finally {
       setDnsList(Array.from(stateMap.values()));
       setIsSpeedTesting(false);
@@ -328,7 +342,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
         <div className="flex gap-2">
           <button 
             onClick={runDNSTest}
-            disabled={isTesting || isLoadingList}
+            disabled={isTesting || isLoadingList || !!globalOperation}
             className="flex-1 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded-xl px-4 py-2.5 flex items-center justify-center gap-2 transition-colors text-sm font-medium whitespace-nowrap"
           >
             {isTesting ? <Activity className="animate-spin w-4 h-4" /> : <Play className="w-4 h-4" />}
@@ -336,11 +350,11 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
           </button>
           <button 
             onClick={runTrafficTest}
-            disabled={isSpeedTesting || isLoadingList}
+            disabled={isSpeedTesting || isLoadingList || !!globalOperation}
             className="flex-1 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-xl px-4 py-2.5 flex items-center justify-center gap-2 transition-colors text-sm font-medium whitespace-nowrap"
           >
             {isSpeedTesting ? <Activity className="animate-spin w-4 h-4" /> : <Zap className="w-4 h-4" />}
-            {isSpeedTesting ? 'در حال 1MB' : 'تست ترافیک 1MB'}
+            {isSpeedTesting ? 'در حال تست ترافیک' : 'تست ترافیک 1MB'}
           </button>
           {(isTesting || isSpeedTesting) && (
             <button

@@ -682,6 +682,39 @@ public class XrayPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void measureConfigDownload(PluginCall call) {
+        final PluginCall pcall = call;
+        try {
+            JSONObject payload = parsePayload(call.getString("config"));
+            delayTestExecutor.execute(() -> {
+                try {
+                    BandwidthTestHelper.BandwidthResult result = BandwidthTestHelper.measure(getContext(), payload, true);
+                    JSObject ret = new JSObject();
+                    ret.put("downloadBps", result.downloadBps);
+                    ret.put("downloadMs", result.downloadMs);
+                    ret.put("ok", result.ok);
+                    if (result.message != null) {
+                        ret.put("message", result.message);
+                    }
+                    android.app.Activity act = getActivity();
+                    if (act != null) {
+                        act.runOnUiThread(() -> pcall.resolve(ret));
+                    } else {
+                        pcall.resolve(ret);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "measureConfigDownload failed", e);
+                    pcall.reject("Failed to measure download: " + e.getMessage());
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            pcall.reject("Too many pending tests in queue, please wait and try again");
+        } catch (Exception e) {
+            pcall.reject("Failed to queue download test: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
     public void getTrafficStats(PluginCall call) {
         JSObject ret = new JSObject();
         ret.put("up", XrayCoreManager.queryStats("proxy", "uplink"));

@@ -46,6 +46,10 @@ final class BandwidthTestHelper {
     private BandwidthTestHelper() {}
 
     static BandwidthResult measure(Context context, JSONObject payload) throws Exception {
+        return measure(context, payload, false);
+    }
+
+    static BandwidthResult measure(Context context, JSONObject payload, boolean downloadOnly) throws Exception {
         String shareUri = payload.optString("shareUri", payload.optString("shareLink", ""));
         if (shareUri.isEmpty()) {
             shareUri = payload.optString("config", "");
@@ -108,6 +112,12 @@ final class BandwidthTestHelper {
             String uploadUrl = payload.optString("uploadUrl", "https://speed.cloudflare.com/__up");
 
             BandwidthSample download = measureDownload(proxy, downloadUrl, timeoutMs);
+            if (downloadOnly) {
+                boolean ok = download.bps >= 0;
+                String message = ok ? null : "Download test failed";
+                return new BandwidthResult(download.bps, -1, download.ms, -1, ok, message);
+            }
+
             BandwidthSample upload = measureUpload(proxy, uploadUrl, bytes, timeoutMs);
 
             boolean ok = download.bps >= 0 && upload.bps >= 0;

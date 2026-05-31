@@ -1,15 +1,21 @@
 "use client";
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Trash2, CheckCircle2, Zap, Smartphone, Hash, Navigation as NavIcon, Link as LinkIcon, X, Clock3, Settings2 } from 'lucide-react';
+import { Plus, Trash2, CheckCircle2, Zap, Smartphone, Hash, Navigation as NavIcon, Link as LinkIcon, X, Clock3, Settings2, Download, Activity } from 'lucide-react';
 import { V2RayConfig } from '../types';
 import { parseV2rayUri, splitConfigLines, measureConfigDelay } from '../utils';
 import { getAppValue, setAppValue } from '../utils/appStorage';
 import { Virtuoso } from 'react-virtuoso';
+import Xray from '../plugins/xray';
+import { buildVpnStartPayload, serializeVpnPayload } from '../utils/vpnPayload';
 
 const MAX_CONFIG_TEST_WORKERS = 100;
 const DEFAULT_CONFIG_TEST_TIMEOUT_MS = 7000;
 const MIN_CONFIG_TEST_TIMEOUT_MS = 3000;
 const MAX_CONFIG_TEST_TIMEOUT_MS = 15000;
+const MAX_DOWNLOAD_TEST_ITEMS = 10;
+const DOWNLOAD_TEST_BYTES = 1_000_000;
+const DOWNLOAD_TEST_TIMEOUT_MS = 12_000;
+const DOWNLOAD_TEST_WORKERS = 2;
 const DEFAULT_CONFIG_TEST_WORKERS = (() => {
   const cores =
     typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
@@ -50,14 +56,18 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
   const [removeBadConfigs, setRemoveBadConfigs] = useState(false);
   const [configTestTotal, setConfigTestTotal] = useState(0);
   const [configTestCompleted, setConfigTestCompleted] = useState(0);
-  const [stopPingRequested, setStopPingRequested] = useState(false);
+  const [isDownloadTesting, setIsDownloadTesting] = useState(false);
+  const [downloadTestTotal, setDownloadTestTotal] = useState(0);
+  const [downloadTestCompleted, setDownloadTestCompleted] = useState(0);
   const [fetchSubProgress, setFetchSubProgress] = useState(0);
   const [fetchSubTotal, setFetchSubTotal] = useState(0);
   const [configTestWorkers, setConfigTestWorkers] = useState(DEFAULT_CONFIG_TEST_WORKERS);
   const [configTestTimeoutMs, setConfigTestTimeoutMs] = useState(DEFAULT_CONFIG_TEST_TIMEOUT_MS);
   const [isTestSettingsHydrated, setIsTestSettingsHydrated] = useState(false);
   const stopPingRequestedRef = useRef(false);
+  const stopDownloadRequestedRef = useRef(false);
   const pingRunIdRef = useRef(0);
+  const downloadRunIdRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,9 +126,22 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     return type === 'vless' || type === 'vmess' || type === 'trojan' || type === 'shadowsocks';
   };
 
+  const formatBandwidth = (bps: number | 'error' | 'testing' | undefined) => {
+    if (typeof bps !== 'number') return bps === 'testing' ? '...' : '--';
+    const mbps = bps / 1_000_000;
+    if (mbps >= 1) {
+      const digits = mbps >= 100 ? 0 : mbps >= 10 ? 1 : 2;
+      return `${mbps.toFixed(digits)} Mbps`;
+    }
+    return `${Math.max(1, Math.round(bps / 1000))} kbps`;
+  };
+
   const requestStopPing = () => {
     stopPingRequestedRef.current = true;
-    setStopPingRequested(true);
+  };
+
+  const requestStopDownload = () => {
+    stopDownloadRequestedRef.current = true;
   };
 
   const fetchSub = async (url: string) => {
@@ -314,7 +337,6 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
 
     setGlobalOperation && setGlobalOperation(true);
     stopPingRequestedRef.current = false;
-    setStopPingRequested(false);
     const runId = pingRunIdRef.current + 1;
     pingRunIdRef.current = runId;
 
@@ -438,7 +460,112 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       }
       setIsPingingAll(false);
       stopPingRequestedRef.current = false;
-      setStopPingRequested(false);
+      setGlobalOperation && setGlobalOperation(false);
+    }
+  };
+
+  const runDownloadTest = async () => {
+    if (isDownloadTesting) return;
+    if (globalOperation) { alert('غŒع© ط¹ظ…ظ„غŒط§طھ ط¯ط± ط­ط§ظ„ ط§ط¬ط±ط§ ط§ط³طھطŒ ظ„ط·ظپط§ظ‹ طµط¨ط± ع©ظ†غŒط¯.'); return; }
+    if (configs.length === 0) return;
+
+    const targets = configs.slice(0, MAX_DOWNLOAD_TEST_ITEMS);
+    if (targets.length === 0) return;
+
+    setGlobalOperation && setGlobalOperation(true);
+    stopDownloadRequestedRef.current = false;
+    const runId = downloadRunIdRef.current + 1;
+    downloadRunIdRef.current = runId;
+
+    setIsDownloadTesting(true);
+    setDownloadTestTotal(targets.length);
+    setDownloadTestCompleted(0);
+
+    setConfigs(prev => prev.map(c => (
+      targets.some(target => target.id === c.id)
+        ? { ...c, downloadBps: 'testing' }
+        : c
+    )));
+    await new Promise(r => setTimeout(r, 0));
+
+    const isRunCurrent = () => downloadRunIdRef.current === runId;
+    const timeoutMs = DOWNLOAD_TEST_TIMEOUT_MS;
+    let batchResultUpdates: { id: string; downloadBps: number | 'error' }[] = [];
+    let nextIndex = 0;
+    let completed = 0;
+    let lastFlushAt = 0;
+
+    const applyBatchUpdates = (force = false) => {
+      if (!isRunCurrent() || batchResultUpdates.length === 0) return;
+      const now = Date.now();
+      if (!force && now - lastFlushAt < CONFIG_RESULT_FLUSH_INTERVAL_MS && batchResultUpdates.length < 2) {
+        return;
+      }
+
+      lastFlushAt = now;
+      const updates = batchResultUpdates;
+      batchResultUpdates = [];
+      setConfigs(prev => {
+        const updatesMap = new Map<string, number | 'error'>();
+        for (const update of updates) {
+          updatesMap.set(update.id, update.downloadBps);
+        }
+        return prev.map(c => {
+          const downloadBps = updatesMap.get(c.id);
+          return downloadBps !== undefined ? { ...c, downloadBps } : c;
+        });
+      });
+    };
+
+    const worker = async () => {
+      while (true) {
+        if (stopDownloadRequestedRef.current || !isRunCurrent()) break;
+        const index = nextIndex++;
+        if (index >= targets.length) break;
+        const conf = targets[index];
+        let downloadBps: number | 'error' = 'error';
+
+        if (isConnectableProtocol(conf.type)) {
+          try {
+            const payload = {
+              ...buildVpnStartPayload(conf, activeDns),
+              strictDns: Boolean(activeDns?.ip),
+              bytes: DOWNLOAD_TEST_BYTES,
+              timeoutMs,
+            };
+            const result = await Xray.measureConfigDownload({
+              config: serializeVpnPayload(payload),
+            });
+            if (result.ok && result.downloadBps >= 0) {
+              downloadBps = result.downloadBps;
+            }
+          } catch (error) {
+            console.warn('Download test failed for config', conf.id, error);
+          }
+        }
+
+        if (!isRunCurrent()) break;
+        completed += 1;
+        setDownloadTestCompleted(completed);
+        batchResultUpdates.push({ id: conf.id, downloadBps });
+        applyBatchUpdates();
+        if (completed % DOWNLOAD_TEST_WORKERS === 0) {
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+    };
+
+    const interval = setInterval(() => applyBatchUpdates(true), CONFIG_RESULT_FLUSH_INTERVAL_MS);
+
+    try {
+      const workers = Array.from({ length: Math.min(DOWNLOAD_TEST_WORKERS, targets.length) }, () => worker());
+      await Promise.all(workers);
+    } finally {
+      clearInterval(interval);
+      applyBatchUpdates(true);
+      setDownloadTestCompleted(completed);
+      setIsDownloadTesting(false);
+      stopDownloadRequestedRef.current = false;
       setGlobalOperation && setGlobalOperation(false);
     }
   };
@@ -457,11 +584,19 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
             <div className="flex gap-2">
               <button 
                 onClick={pingAll}
-                disabled={isPingingAll || configs.length === 0}
+                disabled={isPingingAll || isDownloadTesting || configs.length === 0 || !!globalOperation}
                 className="text-xs px-3 py-2 bg-zinc-800/80 hover:bg-zinc-700 rounded-lg flex items-center gap-2 border border-zinc-700/50 transition-colors"
               >
                 <Zap size={14} className={isPingingAll ? "animate-pulse text-yellow-400" : "text-zinc-400"} />
                 <span>{isPingingAll ? 'درحال تست' : 'پینگ همه'}</span>
+              </button>
+              <button 
+                onClick={runDownloadTest}
+                disabled={isDownloadTesting || isPingingAll || configs.length === 0 || !!globalOperation}
+                className="text-xs px-3 py-2 bg-cyan-600/10 hover:bg-cyan-600/20 rounded-lg flex items-center gap-2 border border-cyan-500/20 transition-colors text-cyan-300"
+              >
+                {isDownloadTesting ? <Activity size={14} className="animate-spin" /> : <Download size={14} />}
+                <span>{isDownloadTesting ? 'در حال دانلود' : 'دانلود 10'}</span>
               </button>
               {isPingingAll && (
                 <button 
@@ -472,10 +607,19 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                   <span>توقف</span>
                 </button>
               )}
+              {isDownloadTesting && (
+                <button 
+                  onClick={requestStopDownload}
+                  className="text-xs px-3 py-2 bg-rose-600/20 hover:bg-rose-600/30 rounded-lg flex items-center gap-2 border border-rose-500/30 transition-colors text-rose-400"
+                >
+                  <X size={14} />
+                  <span>توقف</span>
+                </button>
+              )}
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <label className={`flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/70 px-3 py-2 text-[11px] text-zinc-400 ${isPingingAll ? 'opacity-60' : ''}`}>
+            <label className={`flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/70 px-3 py-2 text-[11px] text-zinc-400 ${isPingingAll || isDownloadTesting ? 'opacity-60' : ''}`}>
               <Settings2 size={13} className="text-cyan-400 shrink-0" />
               <span className="shrink-0">ورکر</span>
               <input
@@ -488,12 +632,12 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                   const next = Number.parseInt(e.target.value || '0', 10);
                   setConfigTestWorkers(clampInt(next, 1, MAX_CONFIG_TEST_WORKERS));
                 }}
-                disabled={isPingingAll}
+                disabled={isPingingAll || isDownloadTesting}
                 className="ml-auto w-16 bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-100 text-center focus:outline-none focus:border-cyan-500 disabled:opacity-50"
                 dir="ltr"
               />
             </label>
-            <label className={`flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/70 px-3 py-2 text-[11px] text-zinc-400 ${isPingingAll ? 'opacity-60' : ''}`}>
+            <label className={`flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/70 px-3 py-2 text-[11px] text-zinc-400 ${isPingingAll || isDownloadTesting ? 'opacity-60' : ''}`}>
               <Clock3 size={13} className="text-amber-400 shrink-0" />
               <span className="shrink-0">timeout</span>
               <input
@@ -506,7 +650,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                   const next = Number.parseInt(e.target.value || '0', 10);
                   setConfigTestTimeoutMs(clampInt(next, MIN_CONFIG_TEST_TIMEOUT_MS, MAX_CONFIG_TEST_TIMEOUT_MS));
                 }}
-                disabled={isPingingAll}
+                disabled={isPingingAll || isDownloadTesting}
                 className="ml-auto w-20 bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-100 text-center focus:outline-none focus:border-amber-500 disabled:opacity-50"
                 dir="ltr"
               />
@@ -522,6 +666,19 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
               </div>
               <div className="text-xs text-zinc-400">
                 {configTestCompleted.toLocaleString('fa-IR')} / {configTestTotal.toLocaleString('fa-IR')} کانفیگ تست شده ({Math.floor((configTestCompleted / Math.max(configTestTotal, 1)) * 100)}%)
+              </div>
+            </div>
+          )}
+          {isDownloadTesting && (
+            <div className="space-y-2">
+              <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-cyan-500 transition-all"
+                  style={{ width: `${Math.floor((downloadTestCompleted / Math.max(downloadTestTotal, 1)) * 100)}%` }}
+                />
+              </div>
+              <div className="text-xs text-zinc-400">
+                {downloadTestCompleted.toLocaleString('fa-IR')} / {downloadTestTotal.toLocaleString('fa-IR')} دانلود تست شده ({Math.floor((downloadTestCompleted / Math.max(downloadTestTotal, 1)) * 100)}%)
               </div>
             </div>
           )}
@@ -565,8 +722,8 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         />
         <button 
           onClick={handleAddConfig}
-          disabled={isBulkImporting || isFetchingSub || isPingingAll}
-          className={`bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl aspect-square w-12 flex items-center justify-center transition-colors shrink-0 ${isBulkImporting || isFetchingSub || isPingingAll ? 'opacity-50 cursor-not-allowed' : ''}`}
+          disabled={isBulkImporting || isFetchingSub || isPingingAll || isDownloadTesting}
+          className={`bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl aspect-square w-12 flex items-center justify-center transition-colors shrink-0 ${isBulkImporting || isFetchingSub || isPingingAll || isDownloadTesting ? 'opacity-50 cursor-not-allowed' : ''}`}
         >
           <Plus size={20} />
         </button>
@@ -634,24 +791,38 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                     </div>
                   </div>
 
-                  <div className="flex justify-between items-center w-full">
+                  <div className="flex justify-between items-center w-full gap-3">
                      <div className="flex gap-3 text-xs text-zinc-400 font-mono items-center" dir="ltr">
                        <span className="flex items-center gap-1"><Hash size={12}/> {config.type}</span>
                        <span className="flex items-center gap-1 truncate max-w-[120px]"><NavIcon size={12}/> {config.address}:{config.port}</span>
                      </div>
 
-                     <div className="flex items-center gap-3">
-                       <button
-                          onClick={(e) => pingConfig(e, config)}
-                          className={`text-xs font-mono min-w-[50px] text-center transition-colors
-                            ${config.ping === 'testing' ? 'text-yellow-400 animate-pulse' : 
-                              (typeof config.ping === 'number' && config.ping < 300) ? 'text-emerald-400' :
-                              (typeof config.ping === 'number' && config.ping >= 300) ? 'text-amber-400' : 
-                              config.ping === 'error' ? 'text-rose-500' : 'text-zinc-500 hover:text-cyan-400'}`}
-                       >
-                         {config.ping === 'testing' ? '...' : config.ping === 'error' ? 'Timeout' : config.ping !== undefined ? `${config.ping}ms` : '--'}
-                       </button>
-                       
+                     <div className="flex items-end gap-3">
+                       <div className="flex flex-col items-end gap-1 text-right">
+                         <button
+                            onClick={(e) => pingConfig(e, config)}
+                            className={`text-xs font-mono min-w-[50px] text-center transition-colors
+                              ${config.ping === 'testing' ? 'text-yellow-400 animate-pulse' : 
+                                (typeof config.ping === 'number' && config.ping < 300) ? 'text-emerald-400' :
+                                (typeof config.ping === 'number' && config.ping >= 300) ? 'text-amber-400' : 
+                                config.ping === 'error' ? 'text-rose-500' : 'text-zinc-500 hover:text-cyan-400'}`}
+                         >
+                           {config.ping === 'testing' ? '...' : config.ping === 'error' ? 'Timeout' : config.ping !== undefined ? `${config.ping}ms` : '--'}
+                         </button>
+                         <div className="min-h-[14px] text-[10px] font-mono whitespace-nowrap flex items-center gap-2">
+                           {config.downloadBps !== undefined && (
+                             <span className={typeof config.downloadBps === 'number' ? 'text-emerald-400' : config.downloadBps === 'testing' ? 'text-yellow-400 animate-pulse' : 'text-zinc-500'}>
+                               D {formatBandwidth(config.downloadBps)}
+                             </span>
+                           )}
+                           {config.uploadBps !== undefined && (
+                             <span className={typeof config.uploadBps === 'number' ? 'text-cyan-400' : config.uploadBps === 'testing' ? 'text-yellow-400 animate-pulse' : 'text-zinc-500'}>
+                               U {formatBandwidth(config.uploadBps)}
+                             </span>
+                           )}
+                         </div>
+                       </div>
+
                        <button onClick={(e) => removeConfig(e, config.id)} className="text-zinc-600 hover:text-rose-500 p-1 transition-colors">
                          <Trash2 size={16} />
                        </button>

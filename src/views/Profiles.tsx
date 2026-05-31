@@ -12,10 +12,23 @@ const MAX_CONFIG_TEST_WORKERS = 100;
 const DEFAULT_CONFIG_TEST_TIMEOUT_MS = 7000;
 const MIN_CONFIG_TEST_TIMEOUT_MS = 3000;
 const MAX_CONFIG_TEST_TIMEOUT_MS = 15000;
-const MAX_DOWNLOAD_TEST_ITEMS = 20;
 const DOWNLOAD_TEST_BYTES = 1_000_000;
 const DOWNLOAD_TEST_TIMEOUT_MS = 12_000;
 const DOWNLOAD_TEST_WORKERS = 2;
+const SUBSCRIPTION_SOURCES = [
+  {
+    name: 'MirSub2',
+    url: 'https://raw.githubusercontent.com/miraali1372/mirsub2/main/subscription.txt',
+  },
+  {
+    name: '5ubscrpt10n VLESS',
+    url: 'https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt',
+  },
+  {
+    name: 'Barry VLESS',
+    url: 'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vless.txt',
+  },
+] as const;
 const DEFAULT_CONFIG_TEST_WORKERS = (() => {
   const cores =
     typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
@@ -61,11 +74,15 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
   const [downloadTestCompleted, setDownloadTestCompleted] = useState(0);
   const [fetchSubProgress, setFetchSubProgress] = useState(0);
   const [fetchSubTotal, setFetchSubTotal] = useState(0);
+  const [selectedSubSourceIndex, setSelectedSubSourceIndex] = useState(0);
+  const [showSubSourceMenu, setShowSubSourceMenu] = useState(false);
   const [configTestWorkers, setConfigTestWorkers] = useState(DEFAULT_CONFIG_TEST_WORKERS);
   const [configTestTimeoutMs, setConfigTestTimeoutMs] = useState(DEFAULT_CONFIG_TEST_TIMEOUT_MS);
   const [isTestSettingsHydrated, setIsTestSettingsHydrated] = useState(false);
   const stopPingRequestedRef = useRef(false);
   const stopDownloadRequestedRef = useRef(false);
+  const subSourceLongPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const subSourceLongPressTriggeredRef = useRef(false);
   const pingRunIdRef = useRef(0);
   const downloadRunIdRef = useRef(0);
 
@@ -138,6 +155,42 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
 
   const downloadScore = (bps: number | 'error' | 'testing' | undefined) => {
     return typeof bps === 'number' ? bps : -1;
+  };
+
+  const hasAnyBandwidth = (config: V2RayConfig) => {
+    return typeof config.downloadBps === 'number' || typeof config.uploadBps === 'number';
+  };
+
+  const openSubSourceMenu = () => {
+    subSourceLongPressTriggeredRef.current = true;
+    setShowSubSourceMenu(true);
+  };
+
+  const startSubSourceLongPress = () => {
+    if (isFetchingSub) return;
+    if (subSourceLongPressTimerRef.current) {
+      clearTimeout(subSourceLongPressTimerRef.current);
+    }
+    subSourceLongPressTimerRef.current = setTimeout(openSubSourceMenu, 550);
+  };
+
+  const cancelSubSourceLongPress = () => {
+    if (subSourceLongPressTimerRef.current) {
+      clearTimeout(subSourceLongPressTimerRef.current);
+      subSourceLongPressTimerRef.current = null;
+    }
+  };
+
+  const fetchSelectedSubSource = () => {
+    const source = SUBSCRIPTION_SOURCES[selectedSubSourceIndex] || SUBSCRIPTION_SOURCES[0];
+    fetchSub(source.url);
+  };
+
+  const chooseSubSource = (index: number) => {
+    const source = SUBSCRIPTION_SOURCES[index] || SUBSCRIPTION_SOURCES[0];
+    setSelectedSubSourceIndex(index);
+    setShowSubSourceMenu(false);
+    fetchSub(source.url);
   };
 
   const requestStopPing = () => {
@@ -473,7 +526,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     if (globalOperation) { alert('غŒع© ط¹ظ…ظ„غŒط§طھ ط¯ط± ط­ط§ظ„ ط§ط¬ط±ط§ ط§ط³طھطŒ ظ„ط·ظپط§ظ‹ طµط¨ط± ع©ظ†غŒط¯.'); return; }
     if (configs.length === 0) return;
 
-    const targets = configs.slice(0, MAX_DOWNLOAD_TEST_ITEMS);
+    const targets = configs.slice();
     if (targets.length === 0) return;
 
     setGlobalOperation && setGlobalOperation(true);
@@ -577,8 +630,12 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
             return downloadBps !== undefined ? { ...c, downloadBps } : c;
           });
           const tested = withFinalResults
-            .filter(c => targetIdSet.has(c.id))
-            .sort((a, b) => downloadScore(b.downloadBps) - downloadScore(a.downloadBps));
+            .filter(c => targetIdSet.has(c.id) && hasAnyBandwidth(c))
+            .sort((a, b) => {
+              const downloadDiff = downloadScore(b.downloadBps) - downloadScore(a.downloadBps);
+              if (downloadDiff !== 0) return downloadDiff;
+              return downloadScore(b.uploadBps) - downloadScore(a.uploadBps);
+            });
           const rest = withFinalResults.filter(c => !targetIdSet.has(c.id));
           return [...tested, ...rest];
         });
@@ -616,7 +673,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 className="text-xs px-3 py-2 bg-cyan-600/10 hover:bg-cyan-600/20 rounded-lg flex items-center gap-2 border border-cyan-500/20 transition-colors text-cyan-300"
               >
                 {isDownloadTesting ? <Activity size={14} className="animate-spin" /> : <Download size={14} />}
-                <span>{isDownloadTesting ? 'در حال دانلود' : `دانلود ${MAX_DOWNLOAD_TEST_ITEMS}`}</span>
+                <span>{isDownloadTesting ? 'در حال دانلود' : 'تست دانلود'}</span>
               </button>
               {isPingingAll && (
                 <button 
@@ -705,15 +762,63 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         </div>
 
         {/* Subscription Import */}
-        <div className="flex gap-2">
+        <div className="relative flex gap-2">
           <button 
-            onClick={() => fetchSub('https://raw.githubusercontent.com/miraali1372/mirsub2/main/subscription.txt')}
+            onClick={() => {
+              if (subSourceLongPressTriggeredRef.current) {
+                subSourceLongPressTriggeredRef.current = false;
+                return;
+              }
+              fetchSelectedSubSource();
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              openSubSourceMenu();
+            }}
+            onMouseDown={startSubSourceLongPress}
+            onMouseUp={cancelSubSourceLongPress}
+            onMouseLeave={cancelSubSourceLongPress}
+            onTouchStart={startSubSourceLongPress}
+            onTouchEnd={cancelSubSourceLongPress}
+            onTouchCancel={cancelSubSourceLongPress}
             disabled={isFetchingSub}
             className="flex-1 text-[10px] px-3 py-2 bg-purple-600/10 text-purple-400 hover:bg-purple-600/20 rounded-lg flex items-center gap-1.5 border border-purple-500/20 transition-colors justify-center"
           >
             <LinkIcon size={12} />
             <span>{isFetchingSub ? 'درحال دریافت...' : 'دریافت کانفیگ'}</span>
+            <span className="text-[9px] text-purple-300/70 truncate max-w-[110px]">
+              {SUBSCRIPTION_SOURCES[selectedSubSourceIndex]?.name}
+            </span>
           </button>
+          {showSubSourceMenu && (
+            <div className="absolute right-0 left-0 top-full z-30 mt-2 rounded-xl border border-zinc-700/70 bg-zinc-950/95 p-2 shadow-2xl">
+              <div className="flex items-center justify-between gap-2 px-2 pb-2">
+                <span className="text-[11px] text-zinc-400">منبع دریافت</span>
+                <button
+                  onClick={() => setShowSubSourceMenu(false)}
+                  className="w-6 h-6 rounded-lg bg-zinc-800 text-zinc-400 flex items-center justify-center hover:text-rose-400"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+              <div className="flex flex-col gap-1">
+                {SUBSCRIPTION_SOURCES.map((source, index) => (
+                  <button
+                    key={source.url}
+                    onClick={() => chooseSubSource(index)}
+                    className={`w-full rounded-lg px-3 py-2 text-right text-[11px] transition-colors border
+                      ${selectedSubSourceIndex === index
+                        ? 'bg-purple-500/15 text-purple-200 border-purple-500/30'
+                        : 'bg-zinc-900/80 text-zinc-300 border-zinc-800 hover:bg-zinc-800'
+                      }`}
+                  >
+                    <div className="font-medium">{source.name}</div>
+                    <div className="mt-1 truncate font-mono text-[9px] text-zinc-500" dir="ltr">{source.url}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
         {isFetchingSub && fetchSubTotal > 0 && (
           <div className="space-y-2 mb-3">

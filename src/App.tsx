@@ -289,12 +289,6 @@ export default function App() {
             setUptime={setUptime}
             lastVpnState={lastVpnState}
             lastVpnUpdatedAt={lastVpnUpdatedAt}
-            currentVersion={currentVersion === 'web' ? 'web' : formatVersion(currentVersion)}
-            latestVersion={latestVersion}
-            updateChecking={updateChecking}
-            updateMessage={updateMessage}
-            hasUpdate={hasUpdate}
-            onCheckUpdate={handleCheckUpdate}
           />
         </div>
         <div className={currentView === 'profiles' ? 'block h-full overflow-y-auto' : 'hidden'}>

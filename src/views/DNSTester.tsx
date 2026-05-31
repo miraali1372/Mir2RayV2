@@ -110,8 +110,6 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     if (sortMode === 'bandwidth') {
       const downDiff = bandwidthScore(b.downloadBps) - bandwidthScore(a.downloadBps);
       if (downDiff !== 0) return downDiff;
-      const upDiff = bandwidthScore(b.uploadBps) - bandwidthScore(a.uploadBps);
-      if (upDiff !== 0) return upDiff;
     }
 
     return latencyScore(a.latency) - latencyScore(b.latency);
@@ -119,7 +117,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
 
   const bestDns = displayList[0];
   const bestDnsHasLatency = typeof bestDns?.latency === 'number';
-  const bestDnsHasSpeed = typeof bestDns?.downloadBps === 'number' && typeof bestDns?.uploadBps === 'number';
+  const bestDnsHasSpeed = typeof bestDns?.downloadBps === 'number';
 
   const runDNSTest = async () => {
     if (isTesting) return;
@@ -211,12 +209,12 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     setSpeedTestCompleted(0);
 
     const workerCount = Math.min(3, targets.length);
-    const timeoutMs = 15_000;
+    const timeoutMs = 12_000;
     const bytes = 1_000_000;
     let stateMap = new Map<string, DnsServer>(dnsList.map(d => [d.ip, d]));
     for (const dns of targets) {
       if (stateMap.has(dns.ip)) {
-        stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps: 'testing', uploadBps: 'testing' });
+        stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps: 'testing', uploadBps: undefined });
       }
     }
     setDnsList(Array.from(stateMap.values()));
@@ -231,7 +229,6 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
         if (index >= targets.length) break;
         const dns = targets[index];
         let downloadBps: number | 'error' = 'error';
-        let uploadBps: number | 'error' = 'error';
 
         try {
           const payload = {
@@ -240,19 +237,18 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             bytes,
             timeoutMs,
           };
-          const result = await Xray.measureConfigBandwidth({
+          const result = await Xray.measureConfigDownload({
             config: serializeVpnPayload(payload),
           });
-          if (result.ok && result.downloadBps >= 0 && result.uploadBps >= 0) {
+          if (result.ok && result.downloadBps >= 0) {
             downloadBps = result.downloadBps;
-            uploadBps = result.uploadBps;
           }
         } catch (e) {
-          console.warn('Bandwidth test failed for DNS', dns.ip, e);
+          console.warn('Download test failed for DNS', dns.ip, e);
         }
 
         if (stateMap.has(dns.ip)) {
-          stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps, uploadBps });
+          stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps, uploadBps: undefined });
         }
 
         completed += 1;
@@ -314,7 +310,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             <p className="text-sm font-bold text-zinc-100 truncate">{bestDns.provider}</p>
             <p className="text-xs text-emerald-400 font-mono mt-0.5" dir="ltr">
               {bestDns.ip} - {sortMode === 'bandwidth'
-                ? `${formatBandwidth(bestDns.downloadBps)} ↓ / ${formatBandwidth(bestDns.uploadBps)} ↑`
+                ? `${formatBandwidth(bestDns.downloadBps)}`
                 : `${bestDns.latency}ms`}
             </p>
           </div>
@@ -354,7 +350,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             className="flex-1 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-xl px-4 py-2.5 flex items-center justify-center gap-2 transition-colors text-sm font-medium whitespace-nowrap"
           >
             {isSpeedTesting ? <Activity className="animate-spin w-4 h-4" /> : <Zap className="w-4 h-4" />}
-            {isSpeedTesting ? 'در حال تست ترافیک' : 'تست ترافیک 1MB'}
+            {isSpeedTesting ? 'در حال تست دانلود' : 'تست دانلود 1MB'}
           </button>
           {(isTesting || isSpeedTesting) && (
             <button
@@ -394,7 +390,7 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             />
           </div>
           <p className="text-[11px] text-zinc-400 mt-2">
-            {speedTestCompleted.toLocaleString('fa-IR')} / {speedTestTotal.toLocaleString('fa-IR')} تست ترافیک انجام شده — {Math.floor((speedTestCompleted / Math.max(speedTestTotal, 1)) * 100)}%
+            {speedTestCompleted.toLocaleString('fa-IR')} / {speedTestTotal.toLocaleString('fa-IR')} تست دانلود انجام شده — {Math.floor((speedTestCompleted / Math.max(speedTestTotal, 1)) * 100)}%
           </p>
         </div>
       )}
@@ -486,11 +482,9 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
                          dns.latency === 'error' ? 'Timeout' :
                          dns.latency !== undefined ? `${dns.latency}ms` : '--'}
                       </span>
-                      {(dns.downloadBps !== undefined || dns.uploadBps !== undefined) && (
+                      {dns.downloadBps !== undefined && (
                         <span className="text-[10px] text-zinc-400 whitespace-nowrap" dir="ltr">
                           <span className="text-emerald-400">D {formatBandwidth(dns.downloadBps)}</span>
-                          <span className="mx-1 text-zinc-600">/</span>
-                          <span className="text-cyan-400">U {formatBandwidth(dns.uploadBps)}</span>
                         </span>
                       )}
                     </div>

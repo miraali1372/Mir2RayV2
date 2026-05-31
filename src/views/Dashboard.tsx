@@ -27,12 +27,6 @@ interface DashboardProps {
   setUptime: React.Dispatch<React.SetStateAction<number>>;
   lastVpnState: boolean | null;
   lastVpnUpdatedAt: string | null;
-  currentVersion: string;
-  latestVersion: string | null;
-  updateChecking: boolean;
-  updateMessage: string;
-  hasUpdate: boolean;
-  onCheckUpdate: () => void;
 }
 
 export function Dashboard({ 
@@ -41,9 +35,7 @@ export function Dashboard({
   isConnected, setIsConnected,
   isConnecting, setIsConnecting,
   uptime, setUptime,
-  lastVpnState, lastVpnUpdatedAt,
-  currentVersion, latestVersion,
-  updateChecking, updateMessage, hasUpdate, onCheckUpdate
+  lastVpnState, lastVpnUpdatedAt
 }: DashboardProps) {
   const [routingMode, setRoutingMode] = useState<'global' | 'apps'>(() => {
     try {
@@ -369,35 +361,6 @@ export function Dashboard({
           <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`} />
           {isConnected ? 'متصل' : 'قطع شده'}
         </div>
-      </div>
-
-      <div className="w-full glass-panel rounded-2xl mb-4 overflow-hidden">
-        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-zinc-800/70">
-          <div className="min-w-0 text-right">
-            <div className="text-sm font-medium text-zinc-200">آپدیت نرم‌افزار</div>
-            <div className="text-[11px] text-zinc-500 truncate">
-              نسخه فعلی {currentVersion}
-              {latestVersion ? ` | نسخه جدید ${latestVersion}` : ''}
-            </div>
-          </div>
-          <button
-            onClick={onCheckUpdate}
-            disabled={updateChecking || isConnecting || !!globalOperation}
-            className={`shrink-0 rounded-xl px-3 py-2.5 text-xs font-medium flex items-center gap-2 transition-colors border
-              ${hasUpdate
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-200 hover:bg-cyan-500/15'
-                : 'bg-zinc-800/70 border-zinc-700/70 text-zinc-200 hover:bg-zinc-800'
-              } disabled:opacity-60 disabled:cursor-not-allowed`}
-          >
-            {updateChecking ? <RefreshCw size={14} className="animate-spin" /> : hasUpdate ? <ArrowDownToLine size={14} /> : <RefreshCw size={14} />}
-            <span>{updateChecking ? 'در حال بررسی...' : hasUpdate ? 'دانلود و نصب' : 'بررسی'}</span>
-          </button>
-        </div>
-        {updateMessage && (
-          <div className={`px-4 py-3 text-[11px] leading-5 ${hasUpdate ? 'text-cyan-200' : 'text-zinc-500'}`}>
-            {updateMessage}
-          </div>
-        )}
       </div>
 
       {/* Main Connect Button Area */}

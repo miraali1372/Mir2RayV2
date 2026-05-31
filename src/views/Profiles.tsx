@@ -12,7 +12,7 @@ const MAX_CONFIG_TEST_WORKERS = 100;
 const DEFAULT_CONFIG_TEST_TIMEOUT_MS = 7000;
 const MIN_CONFIG_TEST_TIMEOUT_MS = 3000;
 const MAX_CONFIG_TEST_TIMEOUT_MS = 15000;
-const MAX_DOWNLOAD_TEST_ITEMS = 10;
+const MAX_DOWNLOAD_TEST_ITEMS = 20;
 const DOWNLOAD_TEST_BYTES = 1_000_000;
 const DOWNLOAD_TEST_TIMEOUT_MS = 12_000;
 const DOWNLOAD_TEST_WORKERS = 2;
@@ -134,6 +134,10 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       return `${mbps.toFixed(digits)} Mbps`;
     }
     return `${Math.max(1, Math.round(bps / 1000))} kbps`;
+  };
+
+  const downloadScore = (bps: number | 'error' | 'testing' | undefined) => {
+    return typeof bps === 'number' ? bps : -1;
   };
 
   const requestStopPing = () => {
@@ -491,6 +495,8 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     const isRunCurrent = () => downloadRunIdRef.current === runId;
     const timeoutMs = DOWNLOAD_TEST_TIMEOUT_MS;
     let batchResultUpdates: { id: string; downloadBps: number | 'error' }[] = [];
+    const finalDownloadResults = new Map<string, number | 'error'>();
+    const targetIdSet = new Set(targets.map(target => target.id));
     let nextIndex = 0;
     let completed = 0;
     let lastFlushAt = 0;
@@ -547,6 +553,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         if (!isRunCurrent()) break;
         completed += 1;
         setDownloadTestCompleted(completed);
+        finalDownloadResults.set(conf.id, downloadBps);
         batchResultUpdates.push({ id: conf.id, downloadBps });
         applyBatchUpdates();
         if (completed % DOWNLOAD_TEST_WORKERS === 0) {
@@ -563,6 +570,19 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     } finally {
       clearInterval(interval);
       applyBatchUpdates(true);
+      if (isRunCurrent()) {
+        setConfigs(prev => {
+          const withFinalResults = prev.map(c => {
+            const downloadBps = finalDownloadResults.get(c.id);
+            return downloadBps !== undefined ? { ...c, downloadBps } : c;
+          });
+          const tested = withFinalResults
+            .filter(c => targetIdSet.has(c.id))
+            .sort((a, b) => downloadScore(b.downloadBps) - downloadScore(a.downloadBps));
+          const rest = withFinalResults.filter(c => !targetIdSet.has(c.id));
+          return [...tested, ...rest];
+        });
+      }
       setDownloadTestCompleted(completed);
       setIsDownloadTesting(false);
       stopDownloadRequestedRef.current = false;
@@ -596,7 +616,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 className="text-xs px-3 py-2 bg-cyan-600/10 hover:bg-cyan-600/20 rounded-lg flex items-center gap-2 border border-cyan-500/20 transition-colors text-cyan-300"
               >
                 {isDownloadTesting ? <Activity size={14} className="animate-spin" /> : <Download size={14} />}
-                <span>{isDownloadTesting ? 'در حال دانلود' : 'دانلود 10'}</span>
+                <span>{isDownloadTesting ? 'در حال دانلود' : `دانلود ${MAX_DOWNLOAD_TEST_ITEMS}`}</span>
               </button>
               {isPingingAll && (
                 <button 

@@ -4,6 +4,8 @@ def releaseKeystoreFile = file('release-keystore.jks')
 def releaseKeystorePassword = System.getenv('MIR2RAY_KEYSTORE_PASSWORD') ?: (project.findProperty('MIR2RAY_KEYSTORE_PASSWORD') ?: 'Mir2RayV2@2026')
 def releaseKeyAlias = System.getenv('MIR2RAY_KEY_ALIAS') ?: (project.findProperty('MIR2RAY_KEY_ALIAS') ?: 'mir2rayv2-release')
 def releaseKeyPassword = System.getenv('MIR2RAY_KEY_PASSWORD') ?: (project.findProperty('MIR2RAY_KEY_PASSWORD') ?: releaseKeystorePassword)
+def appVersionName = System.getenv('MIR2RAY_VERSION_NAME') ?: (project.findProperty('MIR2RAY_VERSION_NAME') ?: '1.0.0')
+def appVersionCode = (System.getenv('MIR2RAY_VERSION_CODE') ?: (project.findProperty('MIR2RAY_VERSION_CODE') ?: '1')) as Integer
 
 if (!releaseKeystoreFile.exists()) {
     throw new GradleException("Missing release keystore: ${releaseKeystoreFile}")
@@ -26,8 +28,8 @@ android {
         applicationId "com.mir2ray.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0.0"
+        versionCode appVersionCode
+        versionName appVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

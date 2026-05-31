@@ -7,7 +7,7 @@ import { Navigation } from './components/Navigation';
 import { Dashboard } from './views/Dashboard';
 import { Profiles } from './views/Profiles';
 import { DNSTester } from './views/DNSTester';
-import { compareVersions, fetchLatestRelease, formatVersion, pickApkAsset } from './utils/update';
+import { compareVersions, fetchLatestRelease, formatVersion, GITHUB_OWNER, GITHUB_REPO, pickApkAsset } from './utils/update';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewState>('dashboard');
@@ -165,9 +165,9 @@ export default function App() {
   const handleCheckUpdate = async () => {
     if (updateChecking) return;
 
-      setUpdateChecking(true);
-      setUpdateMessage('در حال بررسی آخرین نسخه...');
-      setHasUpdate(false);
+    setUpdateChecking(true);
+    setUpdateMessage('در حال بررسی آخرین نسخه...');
+    setHasUpdate(false);
 
     try {
       const info = await Xray.getAppVersionInfo();
@@ -181,50 +181,85 @@ export default function App() {
         return;
       }
 
-      const release = await fetchLatestRelease();
-      const latest = formatVersion(release.tag_name);
-      setLatestVersion(latest);
+      let updateTarget: {
+        tagName: string;
+        latest: string;
+        assetName: string;
+        downloadUrl: string;
+        note: string;
+      };
 
-      const asset = pickApkAsset(release);
-      if (!asset) {
-        setUpdateMessage('فایل APK در ریلیس GitHub پیدا نشد.');
-        return;
+      try {
+        const release = await fetchLatestRelease();
+        const asset = pickApkAsset(release);
+        if (!asset) {
+          throw new Error('APK asset was not found in the GitHub release');
+        }
+        const latest = formatVersion(release.tag_name);
+        const note = (release.body || '')
+          .split('\n')
+          .map(line => line.trim())
+          .find(line => line && !line.startsWith('#')) || `نسخه جدید ${latest} آماده دانلود است.`;
+        updateTarget = {
+          tagName: release.tag_name,
+          latest,
+          assetName: asset.name,
+          downloadUrl: asset.browser_download_url,
+          note,
+        };
+      } catch (releaseError) {
+        console.warn('GitHub API update path failed, trying latest release redirect:', releaseError);
+        const fallback = await Xray.resolveLatestRelease({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          installedVersion,
+        });
+        if (!fallback.ok || !fallback.tagName || !fallback.downloadUrl) {
+          throw new Error(fallback.message || 'Could not resolve latest GitHub APK');
+        }
+        const latest = formatVersion(fallback.tagName);
+        updateTarget = {
+          tagName: fallback.tagName,
+          latest,
+          assetName: fallback.assetName || `Mir2rayV2-${latest}.apk`,
+          downloadUrl: fallback.downloadUrl,
+          note: `نسخه جدید ${latest} آماده دانلود است.`,
+        };
       }
 
-      if (compareVersions(release.tag_name, installedVersion) <= 0) {
+      setLatestVersion(updateTarget.latest);
+
+      if (compareVersions(updateTarget.tagName, installedVersion) <= 0) {
         setHasUpdate(false);
         setUpdateMessage('این آخرین ورژن هست.');
         return;
       }
 
       setHasUpdate(true);
-      const note = (release.body || '')
-        .split('\n')
-        .map(line => line.trim())
-        .find(line => line && !line.startsWith('#')) || `نسخه جدید ${latest} آماده دانلود است.`;
-      setUpdateMessage(note);
+      setUpdateMessage(updateTarget.note);
 
       try {
         const downloaded = await Xray.downloadAndInstallApk({
-          url: asset.browser_download_url,
-          fileName: asset.name,
+          url: updateTarget.downloadUrl,
+          fileName: updateTarget.assetName,
         });
         if (!downloaded.ok) {
           throw new Error(downloaded.message || 'Could not start APK download');
         }
-        setUpdateMessage(`${note} دانلود و نصب آغاز شد.`);
+        setUpdateMessage(`${updateTarget.note} دانلود و نصب آغاز شد.`);
       } catch (installError) {
         console.warn('Native APK download failed, falling back to browser:', installError);
-        const opened = await Xray.openExternalUrl({ url: asset.browser_download_url });
+        const opened = await Xray.openExternalUrl({ url: updateTarget.downloadUrl });
         if (!opened.ok) {
           throw installError;
         }
-        setUpdateMessage(`${note} لینک دانلود در مرورگر باز شد.`);
+        setUpdateMessage(`${updateTarget.note} لینک دانلود در مرورگر باز شد.`);
       }
     } catch (error) {
       console.warn('Update check failed:', error);
       setHasUpdate(false);
-      setUpdateMessage('بررسی آپدیت ناموفق بود.');
+      const detail = error instanceof Error && error.message ? ` (${error.message})` : '';
+      setUpdateMessage(`بررسی یا دانلود آپدیت ناموفق بود${detail}`);
     } finally {
       setUpdateChecking(false);
     }

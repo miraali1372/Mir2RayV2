@@ -5,6 +5,18 @@ export interface XrayPlugin {
   stopVpn(): Promise<{ status: string }>;
   getStatus(): Promise<{ running: boolean; version: string }>;
   getAppVersionInfo(): Promise<{ versionName: string; versionCode: number }>;
+  resolveLatestRelease(options: {
+    owner: string;
+    repo: string;
+    installedVersion?: string;
+  }): Promise<{
+    ok: boolean;
+    tagName: string;
+    htmlUrl: string;
+    assetName: string;
+    downloadUrl: string;
+    message?: string;
+  }>;
   downloadAndInstallApk(options: { url: string; fileName?: string }): Promise<{ ok: boolean; message?: string; path?: string }>;
   pingHost(options: { host: string; port?: number; timeout?: number }): Promise<{ latency: number; ok: boolean }>;
   getCurrentPublicIp(options?: { timeoutMs?: number }): Promise<{ ip: string; ok: boolean; source: 'vpn' | 'direct'; message?: string }>;
@@ -74,6 +86,24 @@ export class XrayWeb extends WebPlugin implements XrayPlugin {
 
   async getAppVersionInfo(): Promise<{ versionName: string; versionCode: number }> {
     return { versionName: 'web', versionCode: 0 };
+  }
+
+  async resolveLatestRelease(): Promise<{
+    ok: boolean;
+    tagName: string;
+    htmlUrl: string;
+    assetName: string;
+    downloadUrl: string;
+    message?: string;
+  }> {
+    return {
+      ok: false,
+      tagName: '',
+      htmlUrl: '',
+      assetName: '',
+      downloadUrl: '',
+      message: 'Release fallback is only available on Android',
+    };
   }
 
   async downloadAndInstallApk(options: { url: string; fileName?: string }): Promise<{ ok: boolean; message?: string; path?: string }> {

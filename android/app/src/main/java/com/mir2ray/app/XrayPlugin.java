@@ -224,6 +224,69 @@ public class XrayPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void resolveLatestRelease(PluginCall call) {
+        String owner = call.getString("owner", "miraali1372");
+        String repo = call.getString("repo", "Mir2RayV2");
+        String installedVersion = call.getString("installedVersion", "");
+        if (owner == null || owner.trim().isEmpty() || repo == null || repo.trim().isEmpty()) {
+            call.reject("GitHub owner and repo are required");
+            return;
+        }
+
+        final PluginCall pcall = call;
+        final String releaseOwner = owner.trim();
+        final String releaseRepo = repo.trim();
+        final String currentVersion = installedVersion == null ? "" : installedVersion.trim();
+
+        updateExecutor.execute(() -> {
+            try {
+                String tagName = resolveLatestReleaseTag(releaseOwner, releaseRepo);
+                java.util.List<String> assetCandidates = buildReleaseAssetCandidates(tagName, currentVersion);
+                String assetName = null;
+                String downloadUrl = null;
+                for (String candidate : assetCandidates) {
+                    String candidateUrl = buildReleaseDownloadUrl(releaseOwner, releaseRepo, tagName, candidate);
+                    if (releaseAssetExists(candidateUrl)) {
+                        assetName = candidate;
+                        downloadUrl = candidateUrl;
+                        break;
+                    }
+                }
+
+                if (assetName == null || downloadUrl == null) {
+                    JSObject ret = new JSObject();
+                    ret.put("ok", false);
+                    ret.put("tagName", tagName);
+                    ret.put("htmlUrl", "https://github.com/" + releaseOwner + "/" + releaseRepo + "/releases/tag/" + tagName);
+                    ret.put("assetName", "");
+                    ret.put("downloadUrl", "");
+                    ret.put("message", "No APK asset matched the latest release");
+                    pcall.resolve(ret);
+                    return;
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                ret.put("tagName", tagName);
+                ret.put("htmlUrl", "https://github.com/" + releaseOwner + "/" + releaseRepo + "/releases/tag/" + tagName);
+                ret.put("assetName", assetName);
+                ret.put("downloadUrl", downloadUrl);
+                pcall.resolve(ret);
+            } catch (Exception e) {
+                Log.e(TAG, "resolveLatestRelease failed", e);
+                JSObject ret = new JSObject();
+                ret.put("ok", false);
+                ret.put("tagName", "");
+                ret.put("htmlUrl", "");
+                ret.put("assetName", "");
+                ret.put("downloadUrl", "");
+                ret.put("message", e.getMessage());
+                pcall.resolve(ret);
+            }
+        });
+    }
+
+    @PluginMethod
     public void setSecure(PluginCall call) {
         String key = call.getString("key", "");
         String value = call.getString("value", "");
@@ -720,6 +783,100 @@ public class XrayPlugin extends Plugin {
         ret.put("up", XrayCoreManager.queryStats("proxy", "uplink"));
         ret.put("down", XrayCoreManager.queryStats("proxy", "downlink"));
         call.resolve(ret);
+    }
+
+    private String resolveLatestReleaseTag(String owner, String repo) throws Exception {
+        HttpURLConnection connection = null;
+        try {
+            URL url = new URL("https://github.com/" + owner + "/" + repo + "/releases/latest");
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(15000);
+            connection.setRequestProperty("User-Agent", "Mir2rayV2-Updater");
+            connection.setRequestProperty("Accept", "text/html,*/*");
+            connection.connect();
+
+            int status = connection.getResponseCode();
+            String location = connection.getHeaderField("Location");
+            if (status >= 300 && status < 400 && location != null && !location.trim().isEmpty()) {
+                String tag = extractReleaseTag(location);
+                if (!tag.isEmpty()) return tag;
+            }
+
+            String finalUrl = connection.getURL() != null ? connection.getURL().toString() : "";
+            String tag = extractReleaseTag(finalUrl);
+            if (!tag.isEmpty()) return tag;
+
+            throw new java.io.IOException("Could not resolve latest release tag (HTTP " + status + ")");
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private String extractReleaseTag(String url) {
+        if (url == null) return "";
+        String marker = "/releases/tag/";
+        int index = url.indexOf(marker);
+        if (index < 0) return "";
+        String tag = url.substring(index + marker.length());
+        int queryIndex = tag.indexOf('?');
+        if (queryIndex >= 0) tag = tag.substring(0, queryIndex);
+        int hashIndex = tag.indexOf('#');
+        if (hashIndex >= 0) tag = tag.substring(0, hashIndex);
+        return Uri.decode(tag.trim());
+    }
+
+    private java.util.List<String> buildReleaseAssetCandidates(String tagName, String installedVersion) {
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        String tag = tagName == null ? "" : tagName.trim();
+        String normalizedTag = tag.replaceFirst("^[vV]", "");
+        if (!tag.isEmpty()) {
+            names.add("Mir2rayV2-" + tag + ".apk");
+        }
+        if (!normalizedTag.isEmpty()) {
+            names.add("Mir2rayV2-v" + normalizedTag + ".apk");
+        }
+        String normalizedInstalled = installedVersion == null ? "" : installedVersion.trim().replaceFirst("^[vV]", "");
+        if (!normalizedInstalled.isEmpty()) {
+            names.add("Mir2rayV2-v" + normalizedInstalled + ".apk");
+        }
+        names.add("Mir2rayV2.apk");
+        names.add("app-release.apk");
+        return new java.util.ArrayList<>(names);
+    }
+
+    private String buildReleaseDownloadUrl(String owner, String repo, String tagName, String assetName) {
+        return "https://github.com/"
+                + owner + "/" + repo
+                + "/releases/download/"
+                + Uri.encode(tagName)
+                + "/"
+                + Uri.encode(assetName);
+    }
+
+    private boolean releaseAssetExists(String url) {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestMethod("HEAD");
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(15000);
+            connection.setRequestProperty("User-Agent", "Mir2rayV2-Updater");
+            connection.setRequestProperty("Accept", "application/vnd.android.package-archive,*/*");
+            int status = connection.getResponseCode();
+            return status >= 200 && status < 400;
+        } catch (Exception e) {
+            Log.w(TAG, "Release asset probe failed: " + url, e);
+            return false;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
     }
 
     private JSONObject parsePayload(String raw) throws Exception {

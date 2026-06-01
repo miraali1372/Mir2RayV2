@@ -5,7 +5,7 @@ import { QRCodeCanvas } from 'qrcode.react';
 import { V2RayConfig, DnsServer } from '../types';
 import { generateExportUri } from '../utils';
 import { buildVpnStartPayload } from '../utils/vpnPayload';
-import { getAppValue, setAppValue } from '../utils/appStorage';
+import { getAppValue, removeAppValue, setAppValue } from '../utils/appStorage';
 // Use Capacitor dynamic Plugins access for runtime permissions
 import { Capacitor } from '@capacitor/core';
 import Xray from '../plugins/xray';
@@ -27,6 +27,29 @@ interface DashboardProps {
   setUptime: React.Dispatch<React.SetStateAction<number>>;
   lastVpnState: boolean | null;
   lastVpnUpdatedAt: string | null;
+}
+
+function parsePackageList(value: string) {
+  return value.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+function buildVpnSessionKey(
+  config: V2RayConfig,
+  dns: DnsServer | null,
+  routingMode: 'global' | 'apps',
+  allowedApps: string[],
+  disallowedApps: string[]
+) {
+  return JSON.stringify({
+    shareUri: config.rawUri,
+    cleanIp: config.cleanIp || '',
+    fragment: config.fragment || null,
+    dnsIp: dns?.ip || '',
+    strictDns: Boolean(dns?.ip),
+    routingMode,
+    allowedApps,
+    disallowedApps,
+  });
 }
 
 export function Dashboard({ 
@@ -54,6 +77,7 @@ export function Dashboard({
   const [showShare, setShowShare] = useState(false);
   const [copiedShare, setCopiedShare] = useState(false);
   const [showSplitTunnel, setShowSplitTunnel] = useState(false);
+  const [connectedSessionKey, setConnectedSessionKey] = useState<string | null>(null);
   const [allowedAppsText, setAllowedAppsText] = useState<string>(() => {
     try { return window.localStorage.getItem('mir2ray_allowed_apps') || ''; } catch { return ''; }
   });
@@ -66,10 +90,11 @@ export function Dashboard({
     let cancelled = false;
     (async () => {
       try {
-        const [savedRoutingMode, savedAllowedApps, savedDisallowedApps] = await Promise.all([
+        const [savedRoutingMode, savedAllowedApps, savedDisallowedApps, savedSessionKey] = await Promise.all([
           getAppValue('routing_mode'),
           getAppValue('allowed_apps'),
           getAppValue('disallowed_apps'),
+          getAppValue('vpn_session_key'),
         ]);
         if (cancelled) return;
         if (savedRoutingMode === 'apps' || savedRoutingMode === 'global') {
@@ -77,6 +102,7 @@ export function Dashboard({
         }
         if (savedAllowedApps !== null) setAllowedAppsText(savedAllowedApps);
         if (savedDisallowedApps !== null) setDisallowedAppsText(savedDisallowedApps);
+        if (savedSessionKey !== null) setConnectedSessionKey(savedSessionKey);
       } catch {
         // keep local defaults
       } finally {
@@ -230,13 +256,32 @@ export function Dashboard({
     throw new Error('هسته Xray در مدت زمان مورد انتظار آماده نشد. لطفاً Logcat را بررسی کنید.');
   };
 
-  const persistVpnState = async (running: boolean) => {
+  const waitForVpnStopped = async (timeoutMs = 8000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const status = await Xray.getStatus();
+        if (!status.running) return;
+      } catch {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  };
+
+  const persistVpnState = async (running: boolean, sessionKey?: string | null) => {
     const stamp = new Date().toISOString();
     try {
-      await Promise.all([
+      const writes: Array<Promise<unknown>> = [
         setAppValue('vpn_last_state', running ? '1' : '0'),
         setAppValue('vpn_last_updated_at', stamp),
-      ]);
+      ];
+      if (running && sessionKey) {
+        writes.push(setAppValue('vpn_session_key', sessionKey));
+      } else {
+        writes.push(removeAppValue('vpn_session_key'));
+      }
+      await Promise.all(writes);
     } catch (error) {
       console.warn('Could not persist VPN session state:', error);
     }
@@ -253,11 +298,26 @@ export function Dashboard({
     setIsConnecting(true);
     setGlobalOperation?.(true);
     try {
-      if (isConnected) {
+      const allowedApps = parsePackageList(allowedAppsText);
+      const disallowedApps = parsePackageList(disallowedAppsText);
+      const nextSessionKey = activeConfig
+        ? buildVpnSessionKey(activeConfig, activeDns, routingMode, allowedApps, disallowedApps)
+        : null;
+      const shouldReconnect =
+        Boolean(isConnected && activeConfig && connectedSessionKey && nextSessionKey && connectedSessionKey !== nextSessionKey);
+
+      if (isConnected && !shouldReconnect) {
         await Xray.stopVpn();
         setIsConnected(false);
         await persistVpnState(false);
         return;
+      }
+
+      if (isConnected && shouldReconnect) {
+        await Xray.stopVpn();
+        await waitForVpnStopped();
+        setIsConnected(false);
+        await persistVpnState(false);
       }
 
       if (!activeConfig) {
@@ -276,8 +336,6 @@ export function Dashboard({
       }
 
       const payload = buildVpnStartPayload(activeConfig, activeDns);
-      const allowedApps = allowedAppsText.split('\n').map(s => s.trim()).filter(Boolean);
-      const disallowedApps = disallowedAppsText.split('\n').map(s => s.trim()).filter(Boolean);
       if (routingMode === 'apps' && allowedApps.length > 0 && disallowedApps.length > 0) {
         throw new Error('در Split-Tunnel فقط یکی از لیست‌های Allowed یا Disallowed را پر کنید.');
       }
@@ -297,7 +355,8 @@ export function Dashboard({
       await waitForVpnReady();
 
       setIsConnected(true);
-      await persistVpnState(true);
+      setConnectedSessionKey(nextSessionKey);
+      await persistVpnState(true, nextSessionKey);
     } catch (err: unknown) {
       console.error('Failed to start VPN via native plugin', err);
       const msg = err instanceof Error ? err.message : 'اتصال VPN ناموفق بود';

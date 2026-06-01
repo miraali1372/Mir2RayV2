@@ -1,7 +1,7 @@
 "use client";
 import React, { useEffect, useRef, useState } from 'react';
 import { Plus, Trash2, CheckCircle2, Zap, Smartphone, Hash, Navigation as NavIcon, Link as LinkIcon, X, Clock3, Settings2, Download, Activity } from 'lucide-react';
-import { V2RayConfig } from '../types';
+import { DnsServer, V2RayConfig } from '../types';
 import { parseV2rayUri, splitConfigLines, measureConfigDelay } from '../utils';
 import { getAppValue, setAppValue } from '../utils/appStorage';
 import { Virtuoso } from 'react-virtuoso';
@@ -54,7 +54,7 @@ interface ProfilesProps {
   setConfigs: React.Dispatch<React.SetStateAction<V2RayConfig[]>>;
   activeConfigId: string | null;
   setActiveConfigId: (id: string | null) => void;
-  activeDns: { ip: string; provider: string } | null;
+  activeDns: DnsServer | null;
   globalOperation?: boolean;
   setGlobalOperation?: (val: boolean) => void;
 }

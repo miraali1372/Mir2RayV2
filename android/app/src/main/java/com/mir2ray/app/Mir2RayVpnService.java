@@ -83,13 +83,18 @@ public class Mir2RayVpnService extends VpnService {
         return START_STICKY;
     }
 
-    private void startVpn(String shareUri, String dnsIp, String cleanIp, FragmentOptions fragment, boolean strictDns) {
-        if (running) {
-            Log.i(TAG, "VPN already running");
-            return;
-        }
-
+    private synchronized void startVpn(String shareUri, String dnsIp, String cleanIp, FragmentOptions fragment, boolean strictDns) {
         try {
+            if (running || XrayCoreManager.isRunning() || vpnInterface != null) {
+                Log.i(TAG, "Restarting VPN with a new config");
+                stopVpn(false);
+                try {
+                    Thread.sleep(250);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
             String configJson = V2rayConfigBuilder.build(this, shareUri, dnsIp, cleanIp, fragment, strictDns);
             Log.d(TAG, "Xray config length: " + configJson.length());
 
@@ -178,7 +183,11 @@ public class Mir2RayVpnService extends VpnService {
         }
     }
 
-    private void stopVpn() {
+    private synchronized void stopVpn() {
+        stopVpn(true);
+    }
+
+    private synchronized void stopVpn(boolean stopService) {
         running = false;
         XrayCoreManager.stopLoop();
 
@@ -191,8 +200,10 @@ public class Mir2RayVpnService extends VpnService {
             vpnInterface = null;
         }
 
-        stopForeground(true);
-        stopSelf();
+        if (stopService) {
+            stopForeground(true);
+            stopSelf();
+        }
     }
 
     private FragmentOptions parseFragment(String json) {

@@ -13,8 +13,8 @@ const DEFAULT_CONFIG_TEST_TIMEOUT_MS = 7000;
 const MIN_CONFIG_TEST_TIMEOUT_MS = 3000;
 const MAX_CONFIG_TEST_TIMEOUT_MS = 15000;
 const DOWNLOAD_TEST_BYTES = 1_000_000;
-const DOWNLOAD_TEST_TIMEOUT_MS = 12_000;
-const DOWNLOAD_TEST_WORKERS = 2;
+const DOWNLOAD_TEST_TIMEOUT_MS = 10_000;
+const DOWNLOAD_TEST_WORKERS = 5;
 const SUBSCRIPTION_SOURCES = [
   {
     name: 'MirSub2',
@@ -34,7 +34,7 @@ const DEFAULT_CONFIG_TEST_WORKERS = (() => {
     typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
       ? navigator.hardwareConcurrency
       : 4;
-  return Math.max(4, Math.min(MAX_CONFIG_TEST_WORKERS, Math.round(cores * 1.5)));
+  return Math.max(100, Math.min(MAX_CONFIG_TEST_WORKERS, Math.round(cores * 1.5)));
 })();
 const CONFIG_RESULT_FLUSH_INTERVAL_MS = 700;
 const CONFIG_RESULT_FLUSH_SIZE = 250;
@@ -962,3 +962,5 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     </div>
   );
 }
+
+

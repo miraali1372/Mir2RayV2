@@ -208,8 +208,8 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     setSpeedTestTotal(targets.length);
     setSpeedTestCompleted(0);
 
-    const workerCount = Math.min(3, targets.length);
-    const timeoutMs = 12_000;
+    const workerCount = Math.min(5, targets.length);
+    const timeoutMs = 10_000;
     const bytes = 1_000_000;
     let stateMap = new Map<string, DnsServer>(dnsList.map(d => [d.ip, d]));
     for (const dns of targets) {

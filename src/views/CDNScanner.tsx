@@ -4,6 +4,7 @@ import { Virtuoso } from 'react-virtuoso';
 import { DnsServer, V2RayConfig } from '../types';
 import { generateCdnIps, measureConfigDelay, testCdnIpDirect } from '../utils';
 import { getJsonValue, setJsonValue } from '../utils/appStorage';
+import { CONFIG_DELAY_TEST_URL } from '../constants/testTargets';
 
 interface CDNScannerProps {
   activeConfigId: string | null;
@@ -192,8 +193,7 @@ export function CDNScanner({
           -1,
           true,
           [
-            'https://cp.cloudflare.com/generate_204',
-            'http://connectivitycheck.gstatic.com/generate_204',
+            CONFIG_DELAY_TEST_URL,
           ]
         );
 

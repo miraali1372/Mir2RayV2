@@ -7,7 +7,8 @@
         "handshake": 4,
         "connIdle": 300,
         "uplinkOnly": 1,
-        "downlinkOnly": 1
+        "downlinkOnly": 1,
+        "bufferSize": 512
       }
     },
     "system": {
@@ -64,7 +65,7 @@
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIP" }
+      "settings": { "domainStrategy": "UseIPv4" }
     },
     {
       "tag": "block",

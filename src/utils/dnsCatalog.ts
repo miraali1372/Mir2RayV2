@@ -1,4 +1,5 @@
 import { DnsServer } from '../types';
+import { fetchTextResource } from './platformFetch';
 
 const IRAN_DNS: DnsServer[] = [
   { ip: '10.202.10.202', provider: 'Radar.game', category: 'iran' },
@@ -85,10 +86,9 @@ async function fetchRemoteDnsIps(): Promise<string[]> {
   const collected: string[] = [];
   for (const url of REMOTE_DNS_LISTS) {
     try {
-      const res = await fetch(url, { cache: 'no-store' });
+      const res = await fetchTextResource(url, { cache: 'no-store' });
       if (!res.ok) continue;
-      const text = await res.text();
-      collected.push(...parseIpLines(text));
+      collected.push(...parseIpLines(res.text));
     } catch {
       /* network blocked — use seeds only */
     }

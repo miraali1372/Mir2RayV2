@@ -194,6 +194,8 @@ public final class V2rayOutboundBuilder {
 
         if (p.fingerPrint != null && !p.fingerPrint.isEmpty()) {
             tls.put("fingerprint", p.fingerPrint);
+        } else if ("reality".equals(p.security)) {
+            tls.put("fingerprint", "chrome");
         }
         if (p.alpn != null && !p.alpn.isEmpty()) {
             JSONArray alpn = new JSONArray();

@@ -1,0 +1,3 @@
+libv2ray=v26.9.9
+rules=Chocolate4U/Iran-v2ray-rules@202609211010
+geoipOnly=v2fly/geoip@202609050329

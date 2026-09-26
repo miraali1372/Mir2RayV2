@@ -1,3 +1,5 @@
+import { fetchTextResource } from './platformFetch';
+
 export const GITHUB_OWNER = 'miraali1372';
 export const GITHUB_REPO = 'Mir2RayV2';
 
@@ -73,26 +75,25 @@ export function pickApkAsset(release: GitHubRelease): GitHubReleaseAsset | null 
   );
 }
 
+export function pickWindowsAsset(release: GitHubRelease): GitHubReleaseAsset | null {
+  const executableAssets = (release.assets || []).filter(asset => asset.name.toLowerCase().endsWith('.exe'));
+  return (
+    executableAssets.find(asset => /mir2ray.*(?:portable|windows)/i.test(asset.name)) ||
+    executableAssets.find(asset => asset.name.toLowerCase().includes('mir2ray')) ||
+    executableAssets[0] ||
+    null
+  );
+}
+
 export async function fetchLatestRelease(
   owner: string = GITHUB_OWNER,
   repo: string = GITHUB_REPO,
   timeoutMs: number = 8000
 ): Promise<GitHubRelease> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/latest`, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-      },
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`GitHub release fetch failed (${response.status})`);
-    }
-    return await response.json() as GitHubRelease;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const response = await fetchTextResource(
+    `https://api.github.com/repos/${owner}/${repo}/releases/latest`,
+    { timeoutMs, cache: 'no-store' }
+  );
+  if (!response.ok) throw new Error(`GitHub release fetch failed (${response.status})`);
+  return JSON.parse(response.text) as GitHubRelease;
 }

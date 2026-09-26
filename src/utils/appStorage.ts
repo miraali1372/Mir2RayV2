@@ -1,5 +1,5 @@
-import { Capacitor } from '@capacitor/core';
 import Xray from '../plugins/xray';
+import { isNativeRuntime } from './platform';
 
 const PREFIX = 'mir2ray_';
 
@@ -9,35 +9,45 @@ function storageKey(key: string): string {
 
 export async function getAppValue(key: string): Promise<string | null> {
   const fullKey = storageKey(key);
-  if (Capacitor.getPlatform() === 'android') {
-    try {
-      const result = await Xray.getSecure({ key: fullKey });
-      if (result.value !== undefined && result.value !== null) return result.value;
-    } catch (error) {
-      console.warn('Secure storage read failed, falling back to localStorage:', error);
+  if (isNativeRuntime()) {
+    const result = await Xray.getSecure({ key: fullKey });
+    if (result.value !== undefined && result.value !== null) return result.value;
+    if (typeof window !== 'undefined') {
+      const legacyValue = window.localStorage.getItem(fullKey);
+      if (legacyValue !== null) {
+        try {
+          await Xray.setSecure({ key: fullKey, value: legacyValue });
+          window.localStorage.removeItem(fullKey);
+        } catch (error) {
+          console.warn('Legacy storage migration failed:', error);
+        }
+        return legacyValue;
+      }
     }
-    return typeof window !== 'undefined' ? window.localStorage.getItem(fullKey) : null;
+    return null;
   }
   return typeof window !== 'undefined' ? window.localStorage.getItem(fullKey) : null;
 }
 
 export async function setAppValue(key: string, value: string): Promise<void> {
   const fullKey = storageKey(key);
-  if (Capacitor.getPlatform() === 'android') {
+  if (isNativeRuntime()) {
     try {
       await Xray.setSecure({ key: fullKey, value });
+      if (typeof window !== 'undefined') window.localStorage.removeItem(fullKey);
+      return;
     } catch (error) {
-      console.warn('Secure storage write failed, mirroring to localStorage:', error);
+      console.warn('Secure storage write failed:', error);
+      // VPN profiles contain credentials and must never fall back to plaintext storage.
+      throw error;
     }
-    if (typeof window !== 'undefined') window.localStorage.setItem(fullKey, value);
-    return;
   }
   if (typeof window !== 'undefined') window.localStorage.setItem(fullKey, value);
 }
 
 export async function removeAppValue(key: string): Promise<void> {
   const fullKey = storageKey(key);
-  if (Capacitor.getPlatform() === 'android') {
+  if (isNativeRuntime()) {
     try {
       await Xray.removeSecure({ key: fullKey });
     } catch (error) {

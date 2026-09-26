@@ -1,8 +1,19 @@
 import { V2RayConfig, DnsServer } from './types';
 
 export { parseV2rayUri, splitConfigLines } from './utils/parseUri';
-export { testLatencyReal, measureConfigDelay, testCdnIpDirect } from './utils/latency';
+export { testLatencyReal, testLatencyAndIp, measureConfigDelay, testCdnIpDirect } from './utils/latency';
 export { loadDnsCatalog } from './utils/dnsCatalog';
+export {
+  annotateConfigQuality,
+  computeConfigQuality,
+  isConnectableConfig,
+  pickBestConfig,
+  rankConfigs,
+  rankConfigsForInstagram,
+  rankConfigsByRealDelay,
+  rankConfigsByTcpLatency,
+  rankConfigsByDownloadSpeed,
+} from './utils/profileQuality';
 
 function safeDecode(str: string): string {
   try {

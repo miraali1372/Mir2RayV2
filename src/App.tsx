@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { Capacitor } from '@capacitor/core';
 import Xray from './plugins/xray';
 import { ViewState, V2RayConfig, DnsServer } from './types';
 import { getAppValue, getJsonValue, removeAppValue, setAppValue, setJsonValue } from './utils/appStorage';
@@ -7,7 +6,11 @@ import { Navigation } from './components/Navigation';
 import { Dashboard } from './views/Dashboard';
 import { Profiles } from './views/Profiles';
 import { DNSTester } from './views/DNSTester';
-import { compareVersions, fetchLatestRelease, formatVersion, GITHUB_OWNER, GITHUB_REPO, pickApkAsset } from './utils/update';
+import { compareVersions, fetchLatestRelease, formatVersion, GITHUB_OWNER, GITHUB_REPO, pickApkAsset, pickWindowsAsset } from './utils/update';
+import { startVpn } from './utils/vpnControl';
+import { isNativeRuntime, runtimePlatform } from './utils/platform';
+import { Capacitor } from '@capacitor/core';
+import { invalidateMeasurements } from './utils/mobileSelection';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewState>('dashboard');
@@ -23,43 +26,71 @@ export default function App() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [uptime, setUptime] = useState(0);
   const [globalOperation, setGlobalOperation] = useState(false);
-  const [lastVpnState, setLastVpnState] = useState<boolean | null>(null);
-  const [lastVpnUpdatedAt, setLastVpnUpdatedAt] = useState<string | null>(null);
-  const [currentVersion, setCurrentVersion] = useState('1.0.0');
+  const [currentVersion, setCurrentVersion] = useState('1.0.1');
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
   const [hasUpdate, setHasUpdate] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [geoUpdating, setGeoUpdating] = useState(false);
+  const [geoMessage, setGeoMessage] = useState('');
+  const [fakeDnsEnabled, setFakeDnsEnabled] = useState(false);
+  const [dohEnabled, setDohEnabled] = useState(false);
+  const [networkKey, setNetworkKey] = useState('unknown');
+  const mobile = Capacitor.getPlatform() === 'android';
+  const measurementContext = JSON.stringify([networkKey, activeDns?.ip ?? '', fakeDnsEnabled, dohEnabled]);
+
+  useEffect(() => {
+    if (!mobile) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const context = await Xray.getNetworkContext();
+        if (!cancelled) setNetworkKey(context.key);
+      } catch { }
+    };
+    void refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [mobile]);
+
+  useEffect(() => {
+    if (!mobile || !isStorageHydrated || networkKey === 'unknown') return;
+    setConfigs(previous => {
+      const next = previous.map(config => invalidateMeasurements(config, measurementContext));
+      return next.every((config, index) => config === previous[index]) ? previous : next;
+    });
+  }, [mobile, isStorageHydrated, measurementContext, networkKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
     let cancelled = false;
     (async () => {
+      let restored = false;
       try {
-        const [savedConfigs, savedActiveConfigId, savedActiveDns, savedView, savedLastVpnState, savedLastVpnUpdatedAt] = await Promise.all([
+        const [savedConfigs, savedActiveConfigId, savedActiveDns, savedView, savedFakeDns, savedDoh] = await Promise.all([
           getJsonValue<V2RayConfig[]>('configs', []),
           getAppValue('active_config_id'),
           getJsonValue<DnsServer | null>('active_dns', null),
           getAppValue('current_view'),
-          getAppValue('vpn_last_state'),
-          getAppValue('vpn_last_updated_at'),
+          getAppValue('fakedns_enabled'),
+          getAppValue('doh_enabled'),
         ]);
         if (!cancelled) {
           setConfigs(savedConfigs);
           setActiveConfigId(savedActiveConfigId);
           setActiveDns(savedActiveDns);
-          if (savedLastVpnState === '1' || savedLastVpnState === '0') {
-            setLastVpnState(savedLastVpnState === '1');
-          }
-          setLastVpnUpdatedAt(savedLastVpnUpdatedAt);
+          setFakeDnsEnabled(savedFakeDns === '1');
+          setDohEnabled(savedDoh === '1');
           if (savedView && ['dashboard','profiles','dns'].includes(savedView)) {
             setCurrentView(savedView as ViewState);
           }
+          restored = true;
         }
       } catch (error) {
         console.warn('Could not restore application state:', error);
       } finally {
-        if (!cancelled) setIsStorageHydrated(true);
+        if (!cancelled && restored) setIsStorageHydrated(true);
       }
     })();
     return () => {
@@ -104,15 +135,14 @@ export default function App() {
   }, [activeDns, isStorageHydrated]);
 
   useEffect(() => {
-    if (Capacitor.getPlatform() !== 'android') return;
+    if (!isNativeRuntime()) return;
 
     const refreshStatus = async () => {
       try {
         const status = await Xray.getStatus();
         setIsConnected(status.running);
-        setLastVpnState(status.running);
-        setLastVpnUpdatedAt(new Date().toISOString());
-        setAppValue('vpn_last_state', status.running ? '1' : '0').catch(error => {
+        if (status.activeConfigId) setActiveConfigId(status.activeConfigId);
+        setAppValue('vpn_last_state', (status.desired ?? status.running) ? '1' : '0').catch(error => {
           console.warn('Could not persist VPN state:', error);
         });
         setAppValue('vpn_last_updated_at', new Date().toISOString()).catch(error => {
@@ -131,7 +161,9 @@ export default function App() {
     };
 
     window.addEventListener('focus', onWindowFocus);
+    const statusTimer = setInterval(refreshStatus, 3000);
     return () => {
+      clearInterval(statusTimer);
       window.removeEventListener('focus', onWindowFocus);
     };
   }, []);
@@ -174,10 +206,11 @@ export default function App() {
       const installedVersion = info.versionName || currentVersion;
       setCurrentVersion(installedVersion);
 
-      if (installedVersion === 'web' || Capacitor.getPlatform() !== 'android') {
+      const platform = info.platform || runtimePlatform();
+      if (installedVersion === 'web' || platform === 'web') {
         setLatestVersion(null);
         setHasUpdate(false);
-        setUpdateMessage('به‌روزرسانی خودکار فقط برای نسخه اندروید فعال است.');
+        setUpdateMessage('به‌روزرسانی خودکار در نسخه وب فعال نیست.');
         return;
       }
 
@@ -191,9 +224,9 @@ export default function App() {
 
       try {
         const release = await fetchLatestRelease();
-        const asset = pickApkAsset(release);
+        const asset = platform === 'windows' ? pickWindowsAsset(release) : pickApkAsset(release);
         if (!asset) {
-          throw new Error('APK asset was not found in the GitHub release');
+          throw new Error(platform === 'windows' ? 'Windows portable asset was not found in the GitHub release' : 'APK asset was not found in the GitHub release');
         }
         const latest = formatVersion(release.tag_name);
         const note = (release.body || '')
@@ -221,7 +254,7 @@ export default function App() {
         updateTarget = {
           tagName: fallback.tagName,
           latest,
-          assetName: fallback.assetName || `Mir2rayV2-${latest}.apk`,
+          assetName: fallback.assetName || (platform === 'windows' ? `Mir2rayV2-${latest}-Portable.exe` : `Mir2rayV2-${latest}.apk`),
           downloadUrl: fallback.downloadUrl,
           note: `نسخه جدید ${latest} آماده دانلود است.`,
         };
@@ -265,19 +298,310 @@ export default function App() {
     }
   };
 
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const persistAppVpnState = async (running: boolean) => {
+    const stamp = new Date().toISOString();
+    setIsConnected(running);
+    try {
+      const writes: Array<Promise<unknown>> = [
+        setAppValue('vpn_last_state', running ? '1' : '0'),
+        setAppValue('vpn_last_updated_at', stamp),
+      ];
+      if (!running) {
+        writes.push(removeAppValue('vpn_session_key'));
+      }
+      await Promise.all(writes);
+    } catch (error) {
+      console.warn('Could not persist VPN state:', error);
+    }
+  };
+
+  const waitForVpnStopped = async (timeoutMs = 12000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const status = await Xray.getStatus();
+        if (!status.running && !status.starting) return true;
+      } catch {
+        return true;
+      }
+      await sleep(300);
+    }
+    return false;
+  };
+
+  const waitForVpnRunning = async (timeoutMs = 15000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const status = await Xray.getStatus();
+        if (status.running) return true;
+      } catch {
+        // ignore transient status failures while the service is coming up
+      }
+      await sleep(300);
+    }
+    return false;
+  };
+
+  const readReconnectOptions = async () => {
+    await Promise.all([
+      setAppValue('routing_mode', 'global'),
+      setAppValue('top5_enabled', '0'),
+      setAppValue('auto_switch_enabled', '0'),
+    ]).catch(error => {
+      console.warn('Could not keep hidden reconnect switches off:', error);
+    });
+
+    return {
+      topFiveEnabled: false,
+      routingMode: 'global' as const,
+      allowedApps: [],
+      disallowedApps: [],
+    };
+  };
+
+  const reconnectAfterGeoUpdate = async () => {
+    if (!activeConfig) {
+      return { success: false, error: 'کانفیگ فعالی برای اتصال مجدد انتخاب نشده است.' };
+    }
+
+    const reconnectOptions = await readReconnectOptions();
+    const primaryConfig = activeConfig;
+    const result = await startVpn(primaryConfig, activeDns, {
+      fakeDns: fakeDnsEnabled,
+      doh: dohEnabled,
+      topFiveEnabled: reconnectOptions.topFiveEnabled,
+      balancedConfigs: [primaryConfig],
+      routingMode: reconnectOptions.routingMode,
+      allowedApps: reconnectOptions.allowedApps,
+      disallowedApps: reconnectOptions.disallowedApps,
+    });
+
+    if (!result.success) {
+      await persistAppVpnState(false);
+      return result;
+    }
+
+    const running = await waitForVpnRunning();
+    if (!running) {
+      await persistAppVpnState(false);
+      return { success: false, error: 'سرویس VPN بعد از اتصال مجدد روشن نشد.' };
+    }
+
+    if (primaryConfig.id !== activeConfig.id) {
+      setActiveConfigId(primaryConfig.id);
+    }
+    await persistAppVpnState(true);
+    return { success: true, fallbackToSingle: result.fallbackToSingle };
+  };
+
+  const handleUpdateGeo = async () => {
+    if (geoUpdating) return;
+    if (!isNativeRuntime()) {
+      setGeoMessage('به‌روزرسانی دیتابیس روتینگ فقط در نسخه نصب‌شده فعال است.');
+      return;
+    }
+    
+    const wasConnected = isConnected;
+    setGlobalOperation(true);
+    setGeoUpdating(true);
+    if (wasConnected) {
+      setGeoMessage('در حال قطع اتصال برای به‌روزرسانی دیتابیس‌ها...');
+      try {
+        await Xray.stopVpn();
+        const stopped = await waitForVpnStopped();
+        await persistAppVpnState(false);
+        if (!stopped) {
+          setGeoMessage('VPN کامل متوقف نشد؛ چند ثانیه دیگر دوباره امتحان کنید.');
+          setGeoUpdating(false);
+          setGlobalOperation(false);
+          return;
+        }
+      } catch (e) {
+        console.warn('Failed to stop VPN before geo update:', e);
+        await persistAppVpnState(false);
+        setGeoMessage('قطع اتصال قبل از آپدیت دیتابیس ناموفق بود؛ دوباره امتحان کنید.');
+        setGeoUpdating(false);
+        setGlobalOperation(false);
+        return;
+      }
+    }
+    
+    setGeoMessage('در حال دانلود آخرین دیتابیس‌های روتینگ (geoip/geosite)...');
+    try {
+      const res = await Xray.updateGeoAssets();
+      if (res.ok) {
+        const mb = (n: number) => (n / 1_000_000).toFixed(1);
+        setGeoMessage(`به‌روز شد ✅ (geoip ${mb(res.geoipBytes)}MB، geosite ${mb(res.geositeBytes)}MB).`);
+        
+        // If VPN was connected, automatically restart it with new geo databases
+        if (wasConnected && activeConfig) {
+          setGeoMessage('در حال راه‌اندازی مجدد اتصال با دیتابیس‌های جدید...');
+          try {
+            const result = await reconnectAfterGeoUpdate();
+            
+            if (result.success) {
+              setGeoMessage('به‌روز شد ✅ و اتصال مجدداً برقرار شد.');
+            } else {
+              setGeoMessage(`به‌روز شد ✅ اما اتصال مجدد ناموفق بود: ${result.error}`);
+            }
+          } catch (reconnectError) {
+            console.warn('Reconnect after geo update failed:', reconnectError);
+            setGeoMessage(`به‌روز شد ✅ اما اتصال مجدد ناموفق بود. لطفاً دستی وصل کنید. (${reconnectError instanceof Error ? reconnectError.message : 'خطا'})`);
+          }
+        }
+      } else {
+        setGeoMessage(res.message || 'به‌روزرسانی ناموفق بود؛ اتصال اینترنت یا فیلترشکن را بررسی کنید.');
+        // If we stopped VPN but update failed, try to reconnect
+        if (wasConnected && activeConfig) {
+          try {
+            await reconnectAfterGeoUpdate();
+          } catch (e) {
+            console.warn('Failed to restore connection after failed geo update:', e);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Geo update failed:', error);
+      const detail = error instanceof Error && error.message ? ` (${error.message})` : '';
+      setGeoMessage(`خطا در به‌روزرسانی دیتابیس‌ها${detail}`);
+      // Try to restore connection if it was active
+      if (wasConnected && activeConfig) {
+        try {
+          await reconnectAfterGeoUpdate();
+        } catch (e) {
+          console.warn('Failed to restore connection after geo update error:', e);
+        }
+      }
+    } finally {
+      setGeoUpdating(false);
+      setGlobalOperation(false);
+    }
+  };
+
+  const toggleFakeDns = () => {
+    const next = !fakeDnsEnabled;
+    setFakeDnsEnabled(next);
+    setAppValue('fakedns_enabled', next ? '1' : '0').catch(() => {});
+  };
+
+  const toggleDoh = () => {
+    const next = !dohEnabled;
+    setDohEnabled(next);
+    setAppValue('doh_enabled', next ? '1' : '0').catch(() => {});
+  };
+
+  // Load the installed app version once so the settings panel shows it.
+  useEffect(() => {
+    if (!isNativeRuntime()) return;
+    let cancelled = false;
+    Xray.getAppVersionInfo()
+      .then(info => { if (!cancelled && info.versionName) setCurrentVersion(info.versionName); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
   const activeConfig = configs.find(c => c.id === activeConfigId) || null;
 
   return (
     <div className="mobile-app-container font-sans" dir="rtl">
-      
+
+      {/* Settings / update button */}
+      <button
+        onClick={() => setShowSettings(true)}
+        aria-label="تنظیمات و به‌روزرسانی"
+        className="fixed top-3 left-3 z-40 w-9 h-9 rounded-full bg-zinc-800/70 border border-zinc-700/60 flex items-center justify-center text-zinc-300 hover:text-cyan-400 hover:border-cyan-500/50 backdrop-blur transition-colors"
+      >
+        <span className="text-lg leading-none">⚙</span>
+      </button>
+
+      {showSettings && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          onClick={() => setShowSettings(false)}
+        >
+          <div
+            className="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-3xl p-5 max-h-[85vh] overflow-y-auto overscroll-contain shadow-2xl"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-bold text-zinc-100">تنظیمات و به‌روزرسانی</h3>
+              <button onClick={() => setShowSettings(false)} className="text-zinc-400 hover:text-zinc-200 text-xl leading-none">✕</button>
+            </div>
+
+            <div className="text-xs text-zinc-500 mb-4">نسخه نصب‌شده: <span className="text-zinc-300">{currentVersion}</span>{latestVersion ? <span className="text-zinc-500"> · آخرین: {latestVersion}</span> : null}</div>
+
+            {/* App update */}
+            <button
+              onClick={handleCheckUpdate}
+              disabled={updateChecking}
+              className={`w-full mb-2 py-3 rounded-xl font-medium text-sm transition-colors ${updateChecking ? 'bg-zinc-800 text-zinc-500' : hasUpdate ? 'bg-gradient-to-br from-emerald-500 to-teal-600 text-zinc-950' : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'}`}
+            >
+              {updateChecking ? 'در حال بررسی...' : 'بررسی و نصب آخرین نسخه برنامه'}
+            </button>
+            {updateMessage ? <p className="text-xs text-zinc-400 mb-4 px-1">{updateMessage}</p> : <div className="mb-4" />}
+
+            {/* Routing database (package) update */}
+            <button
+              onClick={handleUpdateGeo}
+              disabled={geoUpdating}
+              className={`w-full py-3 rounded-xl font-medium text-sm transition-colors ${geoUpdating ? 'bg-zinc-800 text-zinc-500' : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'}`}
+            >
+              {geoUpdating ? 'در حال به‌روزرسانی...' : 'به‌روزرسانی دیتابیس‌های روتینگ (geoip/geosite)'}
+            </button>
+            <p className="text-[11px] text-zinc-500 mt-2 px-1 leading-relaxed">
+              دیتابیس‌های مسیریابی ایران را به آخرین نسخه‌ی معتبر (Chocolate4U، به‌روزرسانی روزانه) می‌رساند تا سایت‌های داخلی و CDNها دقیق‌تر مستقیم شوند.
+            </p>
+            {geoMessage ? <p className="text-xs text-zinc-400 mt-2 px-1">{geoMessage}</p> : null}
+
+            {/* Advanced DNS (opt-in, apply on reconnect) */}
+            <div className="mt-4 pt-4 border-t border-zinc-700/50 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex-1">
+                  <div className="text-sm text-zinc-200">FakeDNS</div>
+                  <div className="text-[11px] text-zinc-500 leading-relaxed">باز شدن سریع‌تر سایت‌ها (تصمیم روتینگ بدون انتظار DNS). آزمایشی — بعد از فعال‌سازی یک‌بار قطع/وصل کنید و اگر مشکلی بود خاموشش کنید.</div>
+                </div>
+                <button
+                  onClick={toggleFakeDns}
+                  className={`shrink-0 w-12 h-7 rounded-full transition-colors relative ${fakeDnsEnabled ? 'bg-cyan-500' : 'bg-zinc-700'}`}
+                  aria-pressed={fakeDnsEnabled}
+                >
+                  <span className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-all ${fakeDnsEnabled ? 'left-1' : 'right-1'}`} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex-1">
+                  <div className="text-sm text-zinc-200">DNS رمزنگاری‌شده (DoH)</div>
+                  <div className="text-[11px] text-zinc-500 leading-relaxed">پرس‌وجوی DNS از طریق HTTPS تا دستکاری نشود. آزمایشی — اگر سرورتان با دامنه است و اتصال برقرار نشد، خاموش کنید.</div>
+                </div>
+                <button
+                  onClick={toggleDoh}
+                  className={`shrink-0 w-12 h-7 rounded-full transition-colors relative ${dohEnabled ? 'bg-cyan-500' : 'bg-zinc-700'}`}
+                  aria-pressed={dohEnabled}
+                >
+                  <span className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-all ${dohEnabled ? 'left-1' : 'right-1'}`} />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Dynamic View Injection */}
-      <main className="flex-1 w-full relative overflow-hidden flex flex-col" style={{ paddingBottom: '112px' }}>
-        <div className={currentView === 'dashboard' ? 'block h-full overflow-y-auto' : 'hidden'}>
+      <main
+        className="flex-1 min-h-0 w-full relative overflow-hidden flex flex-col"
+        style={{ paddingBottom: currentView === 'dashboard' ? '0px' : '112px' }}
+      >
+        <div className={currentView === 'dashboard' ? 'block h-full overflow-hidden' : 'hidden'}>
           <Dashboard 
+            configs={configs}
+            measurementContext={measurementContext}
             activeConfig={activeConfig} 
             activeDns={activeDns}
             setConfigs={setConfigs}
-            setActiveDns={setActiveDns}
+            setActiveConfigId={setActiveConfigId}
             isVisible={currentView === 'dashboard'}
             globalOperation={globalOperation}
             setGlobalOperation={setGlobalOperation}
@@ -287,12 +611,15 @@ export default function App() {
             setIsConnecting={setIsConnecting}
             uptime={uptime}
             setUptime={setUptime}
-            lastVpnState={lastVpnState}
-            lastVpnUpdatedAt={lastVpnUpdatedAt}
+            fakeDnsEnabled={fakeDnsEnabled}
+            dohEnabled={dohEnabled}
           />
         </div>
         <div className={currentView === 'profiles' ? 'block h-full overflow-y-auto' : 'hidden'}>
           <Profiles 
+            measurementContext={measurementContext}
+            fakeDnsEnabled={fakeDnsEnabled}
+            dohEnabled={dohEnabled}
             configs={configs} 
             setConfigs={setConfigs} 
             activeConfigId={activeConfigId} 

@@ -7,6 +7,9 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 final class DnsResolveTestHelper {
@@ -25,6 +28,20 @@ final class DnsResolveTestHelper {
         }
     }
 
+    static final class ResolveResult {
+        final String address;
+        final long latency;
+        final boolean ok;
+        final String message;
+
+        ResolveResult(String address, long latency, boolean ok, String message) {
+            this.address = address;
+            this.latency = latency;
+            this.ok = ok;
+            this.message = message;
+        }
+    }
+
     private DnsResolveTestHelper() {}
 
     static Result test(String dnsIp, String domain, int timeoutMs) {
@@ -33,6 +50,68 @@ final class DnsResolveTestHelper {
         }
         String targetDomain = domain == null || domain.trim().isEmpty()
                 ? "cp.cloudflare.com"
+                : domain.trim();
+        int timeout = Math.max(500, timeoutMs);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
+        List<Long> samples = new ArrayList<>(3);
+        String lastMessage = "DNS query timed out";
+        for (int attempt = 0; attempt < 3; attempt++) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) break;
+            int attemptsLeft = 3 - attempt;
+            int attemptTimeout = (int) Math.max(
+                    250,
+                    TimeUnit.NANOSECONDS.toMillis(remainingNanos) / attemptsLeft
+            );
+            Result sample = testOnce(dnsIp.trim(), targetDomain, attemptTimeout);
+            if (sample.ok && sample.latency >= 0) {
+                samples.add(sample.latency);
+            } else if (sample.message != null && !sample.message.isEmpty()) {
+                lastMessage = sample.message;
+            }
+        }
+
+        if (samples.size() < 2) return new Result(-1, false, lastMessage);
+        Collections.sort(samples);
+        return new Result(samples.get(samples.size() / 2), true, null);
+    }
+
+    private static Result testOnce(String dnsIp, String domain, int timeoutMs) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            InetAddress dnsAddress = InetAddress.getByName(dnsIp);
+            byte[] query = buildQuery(domain);
+            int queryId = ((query[0] & 0xff) << 8) | (query[1] & 0xff);
+            DatagramPacket request = new DatagramPacket(
+                    query,
+                    query.length,
+                    new InetSocketAddress(dnsAddress, 53)
+            );
+
+            socket.setSoTimeout(timeoutMs);
+            long started = System.nanoTime();
+            socket.send(request);
+
+            byte[] buffer = new byte[512];
+            DatagramPacket response = new DatagramPacket(buffer, buffer.length);
+            socket.receive(response);
+            long elapsedMs = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+
+            boolean valid = isValidAnswer(buffer, response.getLength(), queryId);
+            return valid
+                    ? new Result(elapsedMs, true, null)
+                    : new Result(-1, false, "DNS response did not contain a valid answer");
+        } catch (Exception e) {
+            Log.d(TAG, "DNS resolve sample failed", e);
+            return new Result(-1, false, e.getMessage());
+        }
+    }
+
+    static ResolveResult resolveIpv4(String dnsIp, String domain, int timeoutMs) {
+        if (dnsIp == null || dnsIp.trim().isEmpty()) {
+            return new ResolveResult("", -1, false, "DNS IP is required");
+        }
+        String targetDomain = domain == null || domain.trim().isEmpty()
+                ? "www.youtube.com"
                 : domain.trim();
         int timeout = Math.max(500, timeoutMs);
 
@@ -55,13 +134,13 @@ final class DnsResolveTestHelper {
             socket.receive(response);
             long elapsedMs = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
 
-            boolean valid = isValidAnswer(buffer, response.getLength(), queryId);
-            return valid
-                    ? new Result(elapsedMs, true, null)
-                    : new Result(-1, false, "DNS response did not contain a valid answer");
+            String address = findFirstAAnswer(buffer, response.getLength(), queryId);
+            return address != null && !address.isEmpty()
+                    ? new ResolveResult(address, elapsedMs, true, null)
+                    : new ResolveResult("", -1, false, "DNS response did not contain an IPv4 answer");
         } catch (Exception e) {
-            Log.w(TAG, "DNS resolve test failed for " + dnsIp + " / " + targetDomain, e);
-            return new Result(-1, false, e.getMessage());
+            Log.w(TAG, "DNS IPv4 resolve failed", e);
+            return new ResolveResult("", -1, false, e.getMessage());
         }
     }
 
@@ -134,6 +213,48 @@ final class DnsResolveTestHelper {
         }
 
         return false;
+    }
+
+    private static String findFirstAAnswer(byte[] packet, int length, int queryId) {
+        if (length < 12) return null;
+
+        int responseId = ((packet[0] & 0xff) << 8) | (packet[1] & 0xff);
+        if (responseId != queryId) return null;
+
+        int flags = ((packet[2] & 0xff) << 8) | (packet[3] & 0xff);
+        boolean isResponse = (flags & 0x8000) != 0;
+        int rcode = flags & 0x000f;
+        if (!isResponse || rcode != 0) return null;
+
+        int questions = readU16(packet, 4);
+        int answers = readU16(packet, 6);
+        if (answers <= 0) return null;
+
+        int offset = 12;
+        for (int i = 0; i < questions; i++) {
+            offset = skipName(packet, length, offset);
+            if (offset < 0 || offset + 4 > length) return null;
+            offset += 4;
+        }
+
+        for (int i = 0; i < answers; i++) {
+            offset = skipName(packet, length, offset);
+            if (offset < 0 || offset + 10 > length) return null;
+            int type = readU16(packet, offset);
+            int klass = readU16(packet, offset + 2);
+            int rdLength = readU16(packet, offset + 8);
+            offset += 10;
+            if (offset + rdLength > length) return null;
+            if (klass == 1 && type == 1 && rdLength == 4) {
+                return (packet[offset] & 0xff) + "."
+                        + (packet[offset + 1] & 0xff) + "."
+                        + (packet[offset + 2] & 0xff) + "."
+                        + (packet[offset + 3] & 0xff);
+            }
+            offset += rdLength;
+        }
+
+        return null;
     }
 
     private static int skipName(byte[] packet, int length, int offset) {

@@ -1,11 +1,36 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Search, Play, Activity, Globe, WifiHigh, ArrowDownWideNarrow, Check, X, Zap } from 'lucide-react';
+import { Search, Play, Activity, Globe, WifiHigh, ArrowDownWideNarrow, Check, X, Zap, Trash2 } from 'lucide-react';
 import { DnsServer, V2RayConfig } from '../types';
 import { Virtuoso } from 'react-virtuoso';
 import { loadDnsCatalog } from '../utils';
 import { getJsonValue, setJsonValue } from '../utils/appStorage';
 import Xray from '../plugins/xray';
 import { buildVpnStartPayload, serializeVpnPayload } from '../utils/vpnPayload';
+import {
+  CONFIG_DELAY_TEST_URL,
+  DEFAULT_DOWNLOAD_TIMEOUT_MS,
+  DNS_DOWNLOAD_TEST_URL,
+  DOWNLOAD_TEST_BYTES,
+  DOWNLOAD_TEST_URL,
+  UPLOAD_TEST_BYTES,
+  UPLOAD_TEST_URL,
+  getTestHost,
+} from '../constants/testTargets';
+import { progressPercent } from '../utils/progress';
+
+const DNS_TEST_DOMAIN = getTestHost(CONFIG_DELAY_TEST_URL);
+const DNS_TEST_TIMEOUT_MS = 3500;
+const DNS_CONFIG_DELAY_TIMEOUT_MS = 7000;
+const DNS_DOWNLOAD_TIMEOUT_MS = DEFAULT_DOWNLOAD_TIMEOUT_MS;
+const DNS_WORKERS = (() => {
+  const cores =
+    typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
+      ? navigator.hardwareConcurrency
+      : 4;
+  return Math.max(4, Math.min(40, cores * 2));
+})();
+const DNS_DIRECT_DOWNLOAD_WORKERS = 3;
+const DNS_CONFIG_DOWNLOAD_WORKERS = 3;
 
 interface DNSTesterProps {
   activeDns: DnsServer | null;
@@ -29,9 +54,13 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
   const [dnsTestCompleted, setDnsTestCompleted] = useState(0);
   const [speedTestTotal, setSpeedTestTotal] = useState(0);
   const [speedTestCompleted, setSpeedTestCompleted] = useState(0);
+  const [speedTestFailed, setSpeedTestFailed] = useState(0);
+  const [speedTestStage, setSpeedTestStage] = useState('');
   const [isDnsStorageHydrated, setIsDnsStorageHydrated] = useState(false);
   const abortRequestedRef = useRef(false);
   const abortSpeedRequestedRef = useRef(false);
+  const dnsTestPercent = progressPercent(dnsTestCompleted, dnsTestTotal);
+  const speedTestPercent = progressPercent(speedTestCompleted, speedTestTotal);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -92,6 +121,26 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
     return -1;
   };
 
+  const primaryLatency = (dns: DnsServer) => {
+    return dns.configLatency !== undefined ? dns.configLatency : dns.latency;
+  };
+
+  const primaryDownload = (dns: DnsServer) => {
+    return dns.configDownloadBps !== undefined
+      ? dns.configDownloadBps
+      : dns.directDownloadBps !== undefined
+        ? dns.directDownloadBps
+        : dns.downloadBps;
+  };
+
+  const primaryUpload = (dns: DnsServer) => {
+    return dns.configUploadBps !== undefined
+      ? dns.configUploadBps
+      : dns.directUploadBps !== undefined
+        ? dns.directUploadBps
+        : dns.uploadBps;
+  };
+
   const formatBandwidth = (bps: number | 'error' | 'testing' | undefined) => {
     if (typeof bps !== 'number') return bps === 'testing' ? '...' : '--';
     const mbps = bps / 1_000_000;
@@ -108,71 +157,131 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
 
   displayList.sort((a, b) => {
     if (sortMode === 'bandwidth') {
-      const downDiff = bandwidthScore(b.downloadBps) - bandwidthScore(a.downloadBps);
+      const aDownload = bandwidthScore(primaryDownload(a));
+      const aUpload = bandwidthScore(primaryUpload(a));
+      const bDownload = bandwidthScore(primaryDownload(b));
+      const bUpload = bandwidthScore(primaryUpload(b));
+      const balancedDiff = Math.min(bDownload, bUpload) - Math.min(aDownload, aUpload);
+      if (balancedDiff !== 0) return balancedDiff;
+      const uploadDiff = bUpload - aUpload;
+      if (uploadDiff !== 0) return uploadDiff;
+      const downDiff = bDownload - aDownload;
       if (downDiff !== 0) return downDiff;
     }
 
-    return latencyScore(a.latency) - latencyScore(b.latency);
+    return latencyScore(primaryLatency(a)) - latencyScore(primaryLatency(b));
   });
 
   const bestDns = displayList[0];
-  const bestDnsHasLatency = typeof bestDns?.latency === 'number';
-  const bestDnsHasSpeed = typeof bestDns?.downloadBps === 'number';
+  const bestDnsHasLatency = typeof (bestDns ? primaryLatency(bestDns) : undefined) === 'number';
+  const bestDnsHasSpeed = typeof (bestDns ? primaryDownload(bestDns) : undefined) === 'number'
+    && typeof (bestDns ? primaryUpload(bestDns) : undefined) === 'number';
+
+  const clearDnsTestResults = () => {
+    setDnsList(prev => prev.map(dns => {
+      const {
+        latency,
+        configLatency,
+        downloadBps,
+        directDownloadBps,
+        configDownloadBps,
+        uploadBps,
+        directUploadBps,
+        configUploadBps,
+        ...rest
+      } = dns;
+      void latency;
+      void configLatency;
+      void downloadBps;
+      void directDownloadBps;
+      void configDownloadBps;
+      void uploadBps;
+      void directUploadBps;
+      void configUploadBps;
+      return rest;
+    }));
+  };
 
   const runDNSTest = async () => {
     if (isTesting) return;
     if (globalOperation) { alert('یک عملیات در حال اجرا است، لطفاً صبر کنید.'); return; }
     setSortMode('latency');
-    const ipsToTest = displayList.map(d => d.ip);
-    if (ipsToTest.length === 0) return;
+    const targets = displayList.map(d => d.ip);
+    if (targets.length === 0) return;
+    const canConfigTest = Boolean(activeConfig && isConnectableProtocol(activeConfig.type));
 
     setIsTesting(true);
     setGlobalOperation && setGlobalOperation(true);
     abortRequestedRef.current = false;
     setAbortRequested(false);
-    setDnsTestTotal(ipsToTest.length);
+    setDnsTestTotal(targets.length * (canConfigTest ? 2 : 1));
     setDnsTestCompleted(0);
 
     let stateMap = new Map<string, DnsServer>(dnsList.map(d => [d.ip, d]));
-    for (const ip of ipsToTest) {
+    for (const ip of targets) {
       if (stateMap.has(ip)) {
-        stateMap.set(ip, { ...stateMap.get(ip)!, latency: 'testing' });
+        stateMap.set(ip, {
+          ...stateMap.get(ip)!,
+          latency: 'testing',
+          configLatency: canConfigTest ? 'testing' : undefined,
+        });
       }
     }
     setDnsList(Array.from(stateMap.values()));
 
     let completed = 0;
-    const queue = [...ipsToTest];
+    const jobs: Array<{ ip: string; kind: 'direct' | 'config' }> = [];
+    for (const ip of targets) {
+      jobs.push({ ip, kind: 'direct' });
+      if (canConfigTest) jobs.push({ ip, kind: 'config' });
+    }
+    const queue = [...jobs];
     const updateQueue = async (): Promise<void> => {
       if (abortRequestedRef.current) return;
-      const ip = queue.shift();
-      if (!ip) return;
+      const job = queue.shift();
+      if (!job) return;
       let latency: number | 'error' = 'error';
       try {
-        const result = await Xray.testDnsResolve({
-          dnsIp: ip,
-          domain: 'cp.cloudflare.com',
-          timeoutMs: 2500,
-        });
-        latency = result.ok && result.latency >= 0 ? result.latency : 'error';
+        if (job.kind === 'direct') {
+          const result = await Xray.testDnsResolve({
+            dnsIp: job.ip,
+            domain: DNS_TEST_DOMAIN,
+            timeoutMs: DNS_TEST_TIMEOUT_MS,
+          });
+          latency = result.ok && result.latency >= 0 ? result.latency : 'error';
+        } else if (activeConfig) {
+          const result = await Xray.measureConfigDelay({
+            shareUri: activeConfig.rawUri,
+            dnsIp: job.ip,
+            cleanIp: activeConfig.cleanIp,
+            strictDns,
+            timeoutMs: DNS_CONFIG_DELAY_TIMEOUT_MS,
+            testUrl: CONFIG_DELAY_TEST_URL,
+          });
+          latency = result.ok && result.latency >= 0 ? result.latency : 'error';
+        }
       } catch (e) {
         latency = 'error';
       }
 
-      if (stateMap.has(ip)) {
-        stateMap.set(ip, { ...stateMap.get(ip)!, latency });
+      if (stateMap.has(job.ip)) {
+        const current = stateMap.get(job.ip)!;
+        stateMap.set(job.ip, job.kind === 'direct'
+          ? { ...current, latency }
+          : { ...current, configLatency: latency }
+        );
       }
 
       completed += 1;
       setDnsTestCompleted(completed);
-      if (completed % 5 === 0 || queue.length === 0) {
+      if (completed % 8 === 0 || queue.length === 0) {
         setDnsList(Array.from(stateMap.values()));
       }
 
       return updateQueue();
     };
 
-    const CONCURRENCY = Math.min(12, ipsToTest.length);
+    const CONCURRENCY = Math.min(DNS_WORKERS, queue.length);
     const workers = Array.from({ length: CONCURRENCY }, () => updateQueue());
     try {
       await Promise.all(workers);
@@ -189,259 +298,397 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
   const runTrafficTest = async () => {
     if (isSpeedTesting) return;
     if (globalOperation) { alert('یک عملیات در حال اجرا است، لطفاً صبر کنید.'); return; }
-    if (!activeConfig) {
-      alert('برای تست ترافیک DNS، ابتدا یک کانفیگ فعال انتخاب کنید.');
-      return;
-    }
-    if (!isConnectableProtocol(activeConfig.type)) {
-      alert('برای تست ترافیک، یک کانفیگ vless / vmess / trojan / shadowsocks انتخاب کنید.');
-      return;
-    }
+    const canConfigTest = Boolean(activeConfig && isConnectableProtocol(activeConfig.type));
 
     setSortMode('bandwidth');
-    const targets = displayList;
+    const targets = [...displayList];
     if (targets.length === 0) return;
 
     setIsSpeedTesting(true);
-    setGlobalOperation && setGlobalOperation(true);
+    setGlobalOperation?.(true);
     abortSpeedRequestedRef.current = false;
-    setSpeedTestTotal(targets.length);
+    setAbortRequested(false);
+    setSpeedTestTotal(targets.length * (canConfigTest ? 2 : 1));
     setSpeedTestCompleted(0);
+    setSpeedTestFailed(0);
+    setSpeedTestStage('مرحله ۱: دانلود و آپلود مستقیم با DNS');
 
-    const workerCount = Math.min(5, targets.length);
-    const timeoutMs = 10_000;
-    const bytes = 1_000_000;
+    const timeoutMs = DNS_DOWNLOAD_TIMEOUT_MS;
+    const downloadBytes = DOWNLOAD_TEST_BYTES;
+    const uploadBytes = UPLOAD_TEST_BYTES;
+    const originalByIp = new Map(targets.map(dns => [dns.ip, dns]));
     let stateMap = new Map<string, DnsServer>(dnsList.map(d => [d.ip, d]));
     for (const dns of targets) {
       if (stateMap.has(dns.ip)) {
-        stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps: 'testing', uploadBps: undefined });
+        stateMap.set(dns.ip, {
+          ...stateMap.get(dns.ip)!,
+          downloadBps: 'testing',
+          uploadBps: 'testing',
+          directDownloadBps: 'testing',
+          directUploadBps: 'testing',
+          configDownloadBps: undefined,
+          configUploadBps: undefined,
+        });
       }
     }
     setDnsList(Array.from(stateMap.values()));
 
-    let nextIndex = 0;
     let completed = 0;
+    const failedTests = new Set<string>();
 
-    const worker = async () => {
-      while (true) {
-        if (abortSpeedRequestedRef.current) break;
-        const index = nextIndex++;
-        if (index >= targets.length) break;
-        const dns = targets[index];
-        let downloadBps: number | 'error' = 'error';
+    const commitResult = (
+      dns: DnsServer,
+      kind: 'direct' | 'config',
+      downloadBps: number | 'error',
+      uploadBps: number | 'error'
+    ) => {
+      if (downloadBps === 'error' || uploadBps === 'error') {
+        failedTests.add(`${dns.ip}:${kind}`);
+        setSpeedTestFailed(failedTests.size);
+      }
 
-        try {
-          const payload = {
-            ...buildVpnStartPayload(activeConfig, dns),
-            strictDns,
-            bytes,
-            timeoutMs,
-          };
-          const result = await Xray.measureConfigDownload({
-            config: serializeVpnPayload(payload),
-          });
-          if (result.ok && result.downloadBps >= 0) {
-            downloadBps = result.downloadBps;
+      if (stateMap.has(dns.ip)) {
+        const current = stateMap.get(dns.ip)!;
+        stateMap.set(dns.ip, kind === 'direct'
+          ? {
+              ...current,
+              directDownloadBps: downloadBps,
+              directUploadBps: uploadBps,
+              downloadBps,
+              uploadBps,
+            }
+          : {
+              ...current,
+              configDownloadBps: downloadBps,
+              configUploadBps: uploadBps,
+              downloadBps,
+              uploadBps,
+            }
+        );
+      }
+
+      completed += 1;
+      setSpeedTestCompleted(completed);
+      setDnsList(Array.from(stateMap.values()));
+    };
+
+    const runPool = async (
+      laneTargets: DnsServer[],
+      kind: 'direct' | 'config',
+      concurrency: number
+    ) => {
+      let nextIndex = 0;
+      const worker = async () => {
+        while (!abortSpeedRequestedRef.current) {
+          const index = nextIndex++;
+          if (index >= laneTargets.length) break;
+          const dns = laneTargets[index];
+          if (!stateMap.has(dns.ip)) {
+            completed += 1;
+            setSpeedTestCompleted(completed);
+            continue;
           }
-        } catch (e) {
-          console.warn('Download test failed for DNS', dns.ip, e);
-        }
 
-        if (stateMap.has(dns.ip)) {
-          stateMap.set(dns.ip, { ...stateMap.get(dns.ip)!, downloadBps, uploadBps: undefined });
-        }
+          let downloadBps: number | 'error' = 'error';
+          let uploadBps: number | 'error' = 'error';
+          try {
+            if (kind === 'direct') {
+              const result = await Xray.measureDnsBandwidth({
+                dnsIp: dns.ip,
+                downloadUrl: DNS_DOWNLOAD_TEST_URL,
+                uploadUrl: UPLOAD_TEST_URL,
+                timeoutMs,
+                downloadBytes,
+                uploadBytes,
+              });
+              if (result.ok && result.downloadBps > 0 && result.uploadBps > 0) {
+                downloadBps = result.downloadBps;
+                uploadBps = result.uploadBps;
+              }
+            } else if (activeConfig) {
+              const payload = {
+                ...buildVpnStartPayload(activeConfig, dns),
+                strictDns,
+                downloadBytes,
+                uploadBytes,
+                timeoutMs,
+                downloadUrl: DOWNLOAD_TEST_URL,
+                uploadUrl: UPLOAD_TEST_URL,
+              };
+              const result = await Xray.measureConfigBandwidth({
+                config: serializeVpnPayload(payload),
+              });
+              if (result.ok && result.downloadBps > 0 && result.uploadBps > 0) {
+                downloadBps = result.downloadBps;
+                uploadBps = result.uploadBps;
+              }
+            }
+          } catch (e) {
+            console.warn('Bandwidth test failed for a DNS entry', kind, e);
+          }
 
-        completed += 1;
-        setSpeedTestCompleted(completed);
-        setDnsList(Array.from(stateMap.values()));
-        if (completed % workerCount === 0) {
+          commitResult(dns, kind, downloadBps, uploadBps);
           await new Promise(resolve => setTimeout(resolve, 0));
         }
-      }
+      };
+
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, laneTargets.length) },
+        () => worker()
+      ));
     };
 
     try {
-      const workers = Array.from({ length: workerCount }, () => worker());
-      await Promise.all(workers);
+      await runPool(targets, 'direct', DNS_DIRECT_DOWNLOAD_WORKERS);
+
+      if (canConfigTest && !abortSpeedRequestedRef.current) {
+        const configTargets = targets.filter(dns => stateMap.has(dns.ip));
+
+        for (const dns of configTargets) {
+          const current = stateMap.get(dns.ip);
+          if (current) {
+            stateMap.set(dns.ip, {
+              ...current,
+              configDownloadBps: 'testing',
+              configUploadBps: 'testing',
+              downloadBps: 'testing',
+              uploadBps: 'testing',
+            });
+          }
+        }
+        setSpeedTestStage('مرحله ۲: دانلود و آپلود از داخل کانفیگ');
+        setDnsList(Array.from(stateMap.values()));
+        await runPool(configTargets, 'config', DNS_CONFIG_DOWNLOAD_WORKERS);
+      }
     } finally {
+      for (const dns of targets) {
+        const current = stateMap.get(dns.ip);
+        if (!current) continue;
+        const original = originalByIp.get(dns.ip);
+        const directDownloadBps = current.directDownloadBps === 'testing'
+          ? original?.directDownloadBps
+          : current.directDownloadBps;
+        const configDownloadBps = current.configDownloadBps === 'testing'
+          ? original?.configDownloadBps
+          : current.configDownloadBps;
+        const directUploadBps = current.directUploadBps === 'testing'
+          ? original?.directUploadBps
+          : current.directUploadBps;
+        const configUploadBps = current.configUploadBps === 'testing'
+          ? original?.configUploadBps
+          : current.configUploadBps;
+        const downloadBps = current.downloadBps === 'testing'
+          ? configDownloadBps !== undefined
+            ? configDownloadBps
+            : directDownloadBps !== undefined
+              ? directDownloadBps
+              : original?.downloadBps
+          : current.downloadBps;
+        const uploadBps = current.uploadBps === 'testing'
+          ? configUploadBps !== undefined
+            ? configUploadBps
+            : directUploadBps !== undefined
+              ? directUploadBps
+              : original?.uploadBps
+          : current.uploadBps;
+        stateMap.set(dns.ip, {
+          ...current,
+          directDownloadBps,
+          configDownloadBps,
+          directUploadBps,
+          configUploadBps,
+          downloadBps,
+          uploadBps,
+        });
+      }
+
       setDnsList(Array.from(stateMap.values()));
       setIsSpeedTesting(false);
       abortSpeedRequestedRef.current = false;
-      setGlobalOperation && setGlobalOperation(false);
+      setAbortRequested(false);
+      setSpeedTestStage('');
+      setGlobalOperation?.(false);
     }
   };
   
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden pt-12 pb-24 px-6">
+    <div className="flex-1 flex flex-col h-full overflow-hidden pt-8 pb-4 px-4">
       
-      <div className="mb-6">
-        <h2 className="text-xl font-bold tracking-tight text-zinc-100 flex items-center gap-2">
-          <Globe className="text-purple-400" />
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <h2 className="text-lg font-bold tracking-tight text-zinc-100 flex items-center gap-2">
+          <Globe size={18} className="text-purple-400" />
           جعبه ابزار DNS
         </h2>
-        <p className="text-xs text-zinc-500 mt-2 leading-relaxed">
-          فهرست DNS به‌صورت گزینشی و عملیاتی تنظیم شده است (ایران + جهانی). هر تست با کانفیگ فعال روی اندروید تاخیر واقعی را اندازه‌گیری می‌کند.
-        </p>
       </div>
 
-      {activeDns && (
-        <div className="mb-4 bg-purple-500/10 border border-purple-500/30 rounded-xl p-3 flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-purple-500 text-white flex items-center justify-center shrink-0">
-               <Check size={16} />
+      {(activeDns || (bestDns && !isTesting && !isSpeedTesting && ((sortMode === 'latency' && bestDnsHasLatency) || (sortMode === 'bandwidth' && bestDnsHasSpeed)))) && (
+        <div className="mb-2 grid grid-cols-1 gap-1.5">
+          {activeDns && (
+            <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg px-2.5 py-2 flex justify-between items-center gap-2">
+              <div className="min-w-0 flex items-center gap-2">
+                <Check size={14} className="text-purple-300 shrink-0" />
+                <div className="truncate">
+                  <p className="text-xs font-bold text-zinc-100 truncate">{activeDns.provider}</p>
+                  <p className="text-[10px] text-zinc-400 font-mono truncate" dir="ltr">{activeDns.ip}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setActiveDns(null)}
+                className="text-[10px] px-2 py-1 bg-zinc-800 text-zinc-400 rounded-lg hover:text-rose-400 transition-colors shrink-0"
+              >
+                لغو
+              </button>
             </div>
-            <div className="truncate">
-              <p className="text-sm font-bold text-zinc-100 truncate">{activeDns.provider}</p>
-              <p className="text-xs text-zinc-400 font-mono mt-0.5">{activeDns.ip}</p>
+          )}
+
+          {bestDns && !isTesting && !isSpeedTesting && ((sortMode === 'latency' && bestDnsHasLatency) || (sortMode === 'bandwidth' && bestDnsHasSpeed)) && (
+            <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-2.5 py-2 flex justify-between items-center gap-2">
+              <div className="min-w-0 truncate">
+                <p className="text-xs font-bold text-zinc-100 truncate">بهترین: {bestDns.provider}</p>
+                <p className="text-[10px] text-emerald-400 font-mono truncate" dir="ltr">
+                  {bestDns.ip} - {sortMode === 'bandwidth'
+                    ? `D ${formatBandwidth(primaryDownload(bestDns))} / U ${formatBandwidth(primaryUpload(bestDns))}`
+                    : `${primaryLatency(bestDns)}ms`}
+                </p>
+              </div>
+              <button
+                onClick={() => setActiveDns(bestDns)}
+                className="text-[10px] px-2 py-1 bg-emerald-600/20 text-emerald-300 rounded-lg border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors shrink-0"
+              >
+                اعمال
+              </button>
             </div>
-          </div>
-          <button 
-            onClick={() => setActiveDns(null)}
-            className="text-xs px-3 py-1.5 bg-zinc-800 text-zinc-400 rounded-lg hover:text-rose-400 transition-colors shrink-0"
-          >
-            لغو انتخاب
-          </button>
+          )}
         </div>
       )}
 
-      {bestDns && !isTesting && !isSpeedTesting && ((sortMode === 'latency' && bestDnsHasLatency) || (sortMode === 'bandwidth' && bestDnsHasSpeed)) && (
-        <div className="mb-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl p-3 flex justify-between items-center">
-          <div className="truncate">
-            <p className="text-sm font-bold text-zinc-100 truncate">{bestDns.provider}</p>
-            <p className="text-xs text-emerald-400 font-mono mt-0.5" dir="ltr">
-              {bestDns.ip} - {sortMode === 'bandwidth'
-                ? `${formatBandwidth(bestDns.downloadBps)}`
-                : `${bestDns.latency}ms`}
-            </p>
-          </div>
-          <button
-            onClick={() => setActiveDns(bestDns)}
-            className="text-xs px-3 py-2 bg-emerald-600/20 text-emerald-300 rounded-lg border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors shrink-0"
-          >
-            اعمال DNS
-          </button>
-        </div>
-      )}
-
-      <div className="mb-4 flex flex-col gap-2">
+      <div className="mb-2 flex flex-col gap-2">
         <div className="relative">
-          <Search className="absolute left-3 top-3 text-zinc-500 w-4 h-4" />
+          <Search className="absolute left-3 top-2.5 text-zinc-500 w-4 h-4" />
           <input 
             type="text" 
             placeholder="جستجوی IP یا نام..." 
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-10 pr-4 py-2 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50"
+            className="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-9 pr-3 py-2 text-[13px] text-zinc-300 focus:outline-none focus:border-purple-500/50"
             dir="auto"
           />
         </div>
-        <div className="flex gap-2">
+        <div className="grid grid-cols-[1fr_1fr_auto] gap-1.5">
           <button 
             onClick={runDNSTest}
             disabled={isTesting || isLoadingList || !!globalOperation}
-            className="flex-1 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded-xl px-4 py-2.5 flex items-center justify-center gap-2 transition-colors text-sm font-medium whitespace-nowrap"
+            className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded-lg px-2 py-2 flex items-center justify-center gap-1.5 transition-colors text-[11px] font-medium whitespace-nowrap"
           >
-            {isTesting ? <Activity className="animate-spin w-4 h-4" /> : <Play className="w-4 h-4" />}
+            {isTesting ? <Activity className="animate-spin w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
             {isTesting ? 'در حال پینگ' : 'پینگ DNS'}
           </button>
           <button 
             onClick={runTrafficTest}
             disabled={isSpeedTesting || isLoadingList || !!globalOperation}
-            className="flex-1 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-xl px-4 py-2.5 flex items-center justify-center gap-2 transition-colors text-sm font-medium whitespace-nowrap"
+            className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-lg px-2 py-2 flex items-center justify-center gap-1.5 transition-colors text-[11px] font-medium whitespace-nowrap"
           >
-            {isSpeedTesting ? <Activity className="animate-spin w-4 h-4" /> : <Zap className="w-4 h-4" />}
-            {isSpeedTesting ? 'در حال تست دانلود' : 'تست دانلود 1MB'}
+            {isSpeedTesting ? <Activity className="animate-spin w-3.5 h-3.5" /> : <Zap className="w-3.5 h-3.5" />}
+            {isSpeedTesting ? 'در حال تست' : 'تست دانلود/آپلود'}
           </button>
-          {(isTesting || isSpeedTesting) && (
+          {(isTesting || isSpeedTesting) ? (
             <button
               onClick={() => {
                 abortRequestedRef.current = true;
                 abortSpeedRequestedRef.current = true;
                 setAbortRequested(true);
               }}
-              className="bg-rose-600 hover:bg-rose-500 text-white rounded-xl px-3 flex items-center justify-center"
+              className="bg-rose-600 hover:bg-rose-500 text-white rounded-lg px-2 flex items-center justify-center"
               title="توقف"
             >
               <X className="w-4 h-4" />
             </button>
+          ) : (
+            <button
+              onClick={clearDnsTestResults}
+              disabled={isLoadingList || !!globalOperation}
+              className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-400 rounded-lg px-2 flex items-center justify-center"
+              title="پاک‌کردن نتایج تست"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
           )}
         </div>
       </div>
+
       {isTesting && dnsTestTotal > 0 && (
-        <div className="mb-4 px-1">
+        <div className="mb-2 px-1">
           <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className="h-full bg-purple-500 transition-all"
-              style={{ width: `${Math.floor((dnsTestCompleted / dnsTestTotal) * 100)}%` }}
+              style={{ width: `${dnsTestPercent}%` }}
             />
           </div>
-          <p className="text-[11px] text-zinc-400 mt-2">
-            {dnsTestCompleted.toLocaleString('fa-IR')} / {dnsTestTotal.toLocaleString('fa-IR')} تست انجام شده — {Math.floor((dnsTestCompleted / dnsTestTotal) * 100)}%
+          <p className="text-[11px] text-zinc-400 mt-1.5">
+            {dnsTestCompleted.toLocaleString('fa-IR')} / {dnsTestTotal.toLocaleString('fa-IR')} تست انجام شده - {dnsTestPercent}%
           </p>
         </div>
       )}
 
       {isSpeedTesting && speedTestTotal > 0 && (
-        <div className="mb-4 px-1">
+        <div className="mb-2 px-1">
           <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className="h-full bg-cyan-500 transition-all"
-              style={{ width: `${Math.floor((speedTestCompleted / Math.max(speedTestTotal, 1)) * 100)}%` }}
+              style={{ width: `${speedTestPercent}%` }}
             />
           </div>
-          <p className="text-[11px] text-zinc-400 mt-2">
-            {speedTestCompleted.toLocaleString('fa-IR')} / {speedTestTotal.toLocaleString('fa-IR')} تست دانلود انجام شده — {Math.floor((speedTestCompleted / Math.max(speedTestTotal, 1)) * 100)}%
+          <p className="text-[11px] text-zinc-400 mt-1.5">
+            {speedTestCompleted.toLocaleString('fa-IR')} / {speedTestTotal.toLocaleString('fa-IR')} تست دانلود/آپلود انجام شده - {speedTestPercent}%
+            {speedTestFailed > 0 && ` - ${speedTestFailed.toLocaleString('fa-IR')} ناموفق`}
           </p>
+          {speedTestStage && <p className="text-[10px] text-cyan-300 mt-1">{speedTestStage}</p>}
         </div>
       )}
 
-      <div className="flex gap-2 mb-4 overflow-x-auto no-scrollbar pb-1">
+      <div className="flex gap-1.5 mb-2 overflow-x-auto no-scrollbar pb-1">
         <button 
           onClick={() => setFilter('all')} 
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${filter === 'all' ? 'bg-zinc-100 text-zinc-900' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors ${filter === 'all' ? 'bg-zinc-100 text-zinc-900' : 'bg-zinc-800 text-zinc-400'}`}
         >
           همه
         </button>
         <button 
           onClick={() => setFilter('iran')} 
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${filter === 'iran' ? 'bg-purple-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors ${filter === 'iran' ? 'bg-purple-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}
         >
-          شکن و سرویس‌های ایران
+          ایران
         </button>
         <button 
           onClick={() => setFilter('global')} 
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${filter === 'global' ? 'bg-cyan-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors ${filter === 'global' ? 'bg-cyan-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}
         >
-          جهانی (Google, CF)
+          جهانی
         </button>
-        <div className="w-px h-6 bg-zinc-800 my-auto mx-1 shrink-0"></div>
+        <div className="w-px h-5 bg-zinc-800 my-auto mx-0.5 shrink-0"></div>
         <button
           onClick={() => setSortMode('bandwidth')}
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${sortMode === 'bandwidth' ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${sortMode === 'bandwidth' ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30' : 'bg-zinc-800 text-zinc-400'}`}
         >
-          <ArrowDownWideNarrow size={14} />
+          <ArrowDownWideNarrow size={12} />
           سرعت
         </button>
         <button
           onClick={() => setSortMode('latency')}
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${sortMode === 'latency' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${sortMode === 'latency' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' : 'bg-zinc-800 text-zinc-400'}`}
         >
-          <Activity size={14} />
+          <Activity size={12} />
           پینگ
         </button>
         <button
           onClick={() => setStrictDns(!strictDns)}
-          className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${strictDns ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-400'}`}
+          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors ${strictDns ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-400'}`}
         >
           Strict DNS
         </button>
       </div>
 
-      <div className="text-xs text-zinc-500 px-1 mb-2">
-        {isLoadingList ? 'در حال بارگذاری...' : `${displayList.length.toLocaleString('fa-IR')} مورد`}
-      </div>
-
-      <div className="flex-1 min-h-0 -mx-2 px-2 pb-4">
+      <div className="flex-1 min-h-0 -mx-1.5 px-1.5 pb-2">
         {isLoadingList && displayList.length === 0 ? (
            <div className="flex flex-col items-center justify-center p-10 text-zinc-500 font-medium text-sm gap-3">
              <Activity className="animate-spin text-purple-500" />
@@ -455,50 +702,63 @@ export function DNSTester({ activeDns, setActiveDns, activeConfig, globalOperati
             data={displayList}
             itemContent={(_index, dns) => {
               const isActive = activeDns?.ip === dns.ip;
+              const hasConfigLatency = dns.configLatency !== undefined;
+              const hasDirectBandwidth = dns.directDownloadBps !== undefined || dns.directUploadBps !== undefined;
+              const hasConfigBandwidth = dns.configDownloadBps !== undefined || dns.configUploadBps !== undefined;
               return (
                 <div
                   onClick={() => setActiveDns(isActive ? null : dns)}
-                  className={`flex justify-between items-center p-3 mb-2 rounded-xl cursor-pointer transition-all border ${
+                  className={`flex justify-between items-center p-2.5 mb-1.5 rounded-lg cursor-pointer transition-all border ${
                     isActive
                       ? 'bg-purple-900/30 border-purple-500/50'
                       : 'glass-panel border-transparent hover:bg-zinc-800/40'
                   }`}
                 >
-                  <div className="flex items-center gap-3 truncate pr-2">
-                    <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${
-                      isActive ? 'bg-purple-500 text-white' : 'bg-zinc-800 text-zinc-400'
-                    }`}>
-                      {isActive ? <Check size={16} /> : <WifiHigh size={16} />}
-                    </div>
-                    <div className="truncate">
-                      <p className="text-sm font-bold text-zinc-200 truncate">{dns.provider}</p>
-                      <p className="text-xs text-zinc-500 font-mono">{dns.ip}</p>
+                  <div className="flex items-center gap-2 min-w-0 pr-1">
+                    {isActive ? <Check size={15} className="text-purple-300 shrink-0" /> : <WifiHigh size={15} className="text-zinc-500 shrink-0" />}
+                    <div className="min-w-0 truncate">
+                      <p className="text-[12px] font-bold text-zinc-200 truncate">{dns.provider}</p>
+                      <p className="text-[10px] text-zinc-500 font-mono truncate" dir="ltr">{dns.ip}</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    <div className="text-right font-mono text-sm flex flex-col items-end gap-1">
-                      <span>
+                    <div className="text-right font-mono text-[11px] flex flex-col items-end gap-0.5">
+                      <span title="Direct DNS resolve" className={
+                        dns.latency === 'testing' ? 'text-yellow-400 animate-pulse' :
+                        dns.latency === 'error' ? 'text-rose-400' :
+                        typeof dns.latency === 'number' ? 'text-emerald-400' : 'text-zinc-500'
+                      }>
                         {dns.latency === 'testing' ? '...' :
                          dns.latency === 'error' ? 'Timeout' :
                          dns.latency !== undefined ? `${dns.latency}ms` : '--'}
                       </span>
-                      {dns.downloadBps !== undefined && (
-                        <span className="text-[10px] text-zinc-400 whitespace-nowrap" dir="ltr">
-                          <span className="text-emerald-400">D {formatBandwidth(dns.downloadBps)}</span>
+                      {hasConfigLatency && (
+                        <span className="text-[10px] text-purple-300 whitespace-nowrap" dir="ltr" title="Config delay with this DNS">
+                          CFG {dns.configLatency === 'testing' ? '...' :
+                            dns.configLatency === 'error' ? 'Timeout' :
+                            typeof dns.configLatency === 'number' ? `${dns.configLatency}ms` : '--'}
+                        </span>
+                      )}
+                      {(hasDirectBandwidth || hasConfigBandwidth || dns.downloadBps !== undefined || dns.uploadBps !== undefined) && (
+                        <span className="text-[10px] text-zinc-400 flex flex-col items-end leading-4 whitespace-nowrap" dir="ltr">
+                          {hasDirectBandwidth && (
+                            <span className="text-emerald-400">
+                              Direct D {formatBandwidth(dns.directDownloadBps)} / U {formatBandwidth(dns.directUploadBps)}
+                            </span>
+                          )}
+                          {hasConfigBandwidth && (
+                            <span className="text-cyan-400">
+                              CFG D {formatBandwidth(dns.configDownloadBps)} / U {formatBandwidth(dns.configUploadBps)}
+                            </span>
+                          )}
+                          {!hasDirectBandwidth && !hasConfigBandwidth && (
+                            <span className="text-emerald-400">
+                              D {formatBandwidth(dns.downloadBps)} / U {formatBandwidth(dns.uploadBps)}
+                            </span>
+                          )}
                         </span>
                       )}
                     </div>
-                    {(typeof dns.latency === 'number' || typeof dns.downloadBps === 'number') && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setActiveDns(dns);
-                        }}
-                        className="text-[10px] px-2 py-1 bg-purple-600/20 text-purple-300 rounded border border-purple-500/30 hover:bg-purple-600/30 transition-colors"
-                      >
-                        اعمال
-                      </button>
-                    )}
                   </div>
                 </div>
               );

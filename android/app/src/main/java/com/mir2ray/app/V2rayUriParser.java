@@ -6,13 +6,14 @@ import android.util.Log;
 
 import org.json.JSONObject;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Parses v2rayNG-compatible share links (vless://, vmess://, trojan://).
+ * Parses Android VPN share links that can be converted to Xray outbounds here.
  */
 public final class V2rayUriParser {
     private static final String TAG = "V2rayUriParser";
@@ -29,7 +30,10 @@ public final class V2rayUriParser {
             if (uri.startsWith("vmess://")) return parseVmess(uri);
             if (uri.startsWith("trojan://")) return parseTrojan(uri);
             if (uri.startsWith("ss://")) return parseShadowsocks(uri);
-            if (uri.startsWith("hy2://") || uri.startsWith("hysteria2://")) return parseHysteria2(uri);
+            if (uri.startsWith("hy2://") || uri.startsWith("hysteria2://")) {
+                Log.w(TAG, "Hysteria2 links are not supported by the Android VPN builder yet");
+                return null;
+            }
         } catch (Exception e) {
             Log.e(TAG, "Failed to parse URI", e);
         }
@@ -67,15 +71,7 @@ public final class V2rayUriParser {
 
         if (payload.contains("@")) {
             Uri parsed = Uri.parse(fixIllegalUrl("ss://" + payload));
-            String userInfo = parsed.getUserInfo();
-            if (userInfo != null && userInfo.contains(":")) {
-                String[] parts = userInfo.split(":", 2);
-                item.method = parts[0];
-                item.password = parts[1];
-            } else {
-                item.password = userInfo;
-                item.method = "aes-256-gcm";
-            }
+            applyShadowsocksUserInfo(item, parsed.getUserInfo());
             item.server = parsed.getHost();
             item.serverPort = String.valueOf(parsed.getPort());
             Map<String, String> query = parseQuery(parsed);
@@ -83,33 +79,52 @@ public final class V2rayUriParser {
             return item;
         }
 
-        String decoded = new String(Base64.decode(payload, Base64.DEFAULT), StandardCharsets.UTF_8);
+        String decoded = decodeBase64(payload);
         String body = decoded.contains("@") ? decoded : "ss://" + decoded;
         Uri parsed = Uri.parse(fixIllegalUrl(body.startsWith("ss://") ? body : "ss://" + body));
-        String userInfo = parsed.getUserInfo();
-        if (userInfo != null && userInfo.contains(":")) {
-            String[] parts = userInfo.split(":", 2);
-            item.method = parts[0];
-            item.password = parts[1];
-        }
+        applyShadowsocksUserInfo(item, parsed.getUserInfo());
         item.server = parsed.getHost();
         item.serverPort = String.valueOf(parsed.getPort());
         return item;
     }
 
-    private static ProfileItem parseHysteria2(String uri) {
-        Uri parsed = Uri.parse(fixIllegalUrl(uri.replace("hysteria2://", "hy2://")));
-        ProfileItem item = new ProfileItem();
-        item.configType = "hysteria2";
-        item.remarks = decodeFragment(parsed.getFragment());
-        item.server = parsed.getHost();
-        item.serverPort = String.valueOf(parsed.getPort());
-        item.password = parsed.getUserInfo();
-        Map<String, String> query = parseQuery(parsed);
-        item.security = query.getOrDefault("security", "tls");
-        item.sni = query.get("sni");
-        item.insecure = "1".equals(query.get("insecure"));
-        return item;
+    private static void applyShadowsocksUserInfo(ProfileItem item, String userInfo) {
+        String decodedUserInfo = decodeUserInfo(userInfo);
+        if (decodedUserInfo != null && decodedUserInfo.contains(":")) {
+            String[] parts = decodedUserInfo.split(":", 2);
+            item.method = parts[0];
+            item.password = parts[1];
+        } else {
+            item.method = "aes-256-gcm";
+            item.password = decodedUserInfo != null ? decodedUserInfo : "";
+        }
+    }
+
+    private static String decodeUserInfo(String userInfo) {
+        if (userInfo == null || userInfo.isEmpty()) return userInfo;
+        String decoded = urlDecode(userInfo);
+        if (decoded.contains(":")) return decoded;
+        try {
+            String base64Decoded = decodeBase64(decoded);
+            return base64Decoded != null && !base64Decoded.isEmpty() ? base64Decoded : decoded;
+        } catch (Exception ignored) {
+            return decoded;
+        }
+    }
+
+    private static String decodeBase64(String payload) {
+        String normalized = payload.replace('-', '+').replace('_', '/');
+        int queryIndex = normalized.indexOf('?');
+        if (queryIndex >= 0) normalized = normalized.substring(0, queryIndex);
+        int hashIndex = normalized.indexOf('#');
+        if (hashIndex >= 0) normalized = normalized.substring(0, hashIndex);
+        int padding = (4 - (normalized.length() % 4)) % 4;
+        if (padding > 0) {
+            StringBuilder sb = new StringBuilder(normalized);
+            for (int i = 0; i < padding; i++) sb.append('=');
+            normalized = sb.toString();
+        }
+        return new String(Base64.decode(normalized, Base64.DEFAULT), StandardCharsets.UTF_8);
     }
 
     private static ProfileItem parseTrojan(String uri) {
@@ -139,7 +154,7 @@ public final class V2rayUriParser {
         if (payload.contains("?") && payload.contains("&")) {
             return parseVmessStd(uri);
         }
-        String decoded = new String(Base64.decode(payload, Base64.DEFAULT), StandardCharsets.UTF_8);
+        String decoded = decodeBase64(payload);
         JSONObject json = new JSONObject(decoded);
         ProfileItem item = new ProfileItem();
         item.configType = "vmess";
@@ -224,11 +239,11 @@ public final class V2rayUriParser {
         for (String part : raw.split("&")) {
             int idx = part.indexOf('=');
             if (idx > 0) {
-                String key = URLDecoder.decode(part.substring(0, idx), StandardCharsets.UTF_8);
-                String value = URLDecoder.decode(part.substring(idx + 1), StandardCharsets.UTF_8);
+                String key = urlDecode(part.substring(0, idx));
+                String value = urlDecode(part.substring(idx + 1));
                 map.put(key, value);
             } else if (!part.isEmpty()) {
-                map.put(URLDecoder.decode(part, StandardCharsets.UTF_8), "");
+                map.put(urlDecode(part), "");
             }
         }
         return map;
@@ -236,7 +251,15 @@ public final class V2rayUriParser {
 
     private static String decodeFragment(String fragment) {
         if (fragment == null || fragment.isEmpty()) return "Mir2rayV2";
-        return URLDecoder.decode(fragment, StandardCharsets.UTF_8);
+        return urlDecode(fragment);
+    }
+
+    private static String urlDecode(String value) {
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8.name());
+        } catch (UnsupportedEncodingException e) {
+            throw new IllegalStateException("UTF-8 is not supported", e);
+        }
     }
 
     private static String fixIllegalUrl(String url) {

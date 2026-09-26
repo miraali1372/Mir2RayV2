@@ -1,11 +1,45 @@
-import { Capacitor } from '@capacitor/core';
 import Xray from '../plugins/xray';
+import { CONFIG_DELAY_TEST_URL } from '../constants/testTargets';
+import { isNativeRuntime } from './platform';
 
 const DEFAULT_DELAY_TEST_URLS = [
-  'https://cp.cloudflare.com/generate_204',
-  'https://www.google.com/generate_204',
-  'http://connectivitycheck.gstatic.com/generate_204',
+  CONFIG_DELAY_TEST_URL,
 ];
+
+export interface LatencyAndIpResult {
+  latency: number | 'error';
+  ip?: string;
+}
+
+/**
+ * Real latency and resolved IP test.
+ * Android: TCP connect via native plugin.
+ */
+export async function testLatencyAndIp(
+  ipOrHost: string,
+  port: string | number = 443,
+  timeoutMs: number = 2000
+): Promise<LatencyAndIpResult> {
+  const host = (ipOrHost || '').trim();
+  if (!host) return { latency: 'error' };
+
+  const portNum = typeof port === 'string' ? parseInt(port, 10) || 443 : port;
+
+  if (isNativeRuntime()) {
+    try {
+      const result = await Xray.pingHost({ host, port: portNum, timeout: timeoutMs });
+      if (result.ok && typeof result.latency === 'number' && result.latency >= 0) {
+        return { latency: result.latency, ip: result.ip };
+      }
+      return { latency: 'error', ip: result.ip };
+    } catch {
+      return { latency: 'error' };
+    }
+  }
+
+  const latency = await testLatencyReal(host, portNum, timeoutMs);
+  return { latency };
+}
 
 /**
  * Real latency test.
@@ -22,7 +56,7 @@ export async function testLatencyReal(
 
   const portNum = typeof port === 'string' ? parseInt(port, 10) || 443 : port;
 
-  if (Capacitor.getPlatform() === 'android') {
+  if (isNativeRuntime()) {
     try {
       const result = await Xray.pingHost({ host, port: portNum, timeout: timeoutMs });
       if (result.ok && typeof result.latency === 'number' && result.latency >= 0) {
@@ -57,7 +91,7 @@ export async function testCdnIpDirect(
   timeoutMs: number = 2500
 ): Promise<number | 'error'> {
   if (!ip) return 'error';
-  if (Capacitor.getPlatform() !== 'android') return 'error';
+  if (!isNativeRuntime()) return 'error';
   
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs + 1000);
@@ -92,7 +126,7 @@ export async function measureConfigDelay(
   strictDns: boolean = false,
   testUrls: string[] = DEFAULT_DELAY_TEST_URLS
 ): Promise<number | 'error'> {
-  if (Capacitor.getPlatform() !== 'android') return 'error';
+  if (!isNativeRuntime()) return 'error';
 
   for (const testUrl of testUrls) {
     try {

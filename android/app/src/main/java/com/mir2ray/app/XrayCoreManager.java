@@ -10,6 +10,7 @@ import libv2ray.CoreController;
 import libv2ray.Libv2ray;
 
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -18,19 +19,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class XrayCoreManager {
     private static final String TAG = "XrayCoreManager";
     private static final AtomicBoolean initialized = new AtomicBoolean(false);
+    private static final AtomicBoolean running = new AtomicBoolean(false);
 
     private static CoreController coreController;
-    private static volatile VpnService vpnService;
+    private static volatile WeakReference<VpnService> vpnServiceRef = new WeakReference<>(null);
 
     private XrayCoreManager() {}
 
     public static void bindVpnService(VpnService service) {
-        vpnService = service;
+        vpnServiceRef = new WeakReference<>(service);
     }
 
     public static void unbindVpnService(VpnService service) {
-        if (vpnService == service) {
-            vpnService = null;
+        VpnService current = vpnServiceRef.get();
+        if (current == service) {
+            vpnServiceRef = new WeakReference<>(null);
         }
     }
 
@@ -44,12 +47,14 @@ public final class XrayCoreManager {
             CoreCallbackHandler callbackHandler = new CoreCallbackHandler() {
                 @Override
                 public long startup() {
+                    running.set(true);
                     Log.i(TAG, "Xray core started");
                     return 0;
                 }
 
                 @Override
                 public long shutdown() {
+                    running.set(false);
                     Log.i(TAG, "Xray core shutdown");
                     return 0;
                 }
@@ -76,39 +81,48 @@ public final class XrayCoreManager {
                 Log.w(TAG, "Failed to register ProcessFinder", e);
             }
             Log.i(TAG, "Xray core initialized: " + Libv2ray.checkVersionX());
-        } catch (Exception e) {
+        } catch (Exception | LinkageError e) {
             initialized.set(false);
+            running.set(false);
+            coreController = null;
             Log.e(TAG, "Failed to initialize Xray core", e);
             throw new RuntimeException(e);
         }
     }
 
     public static boolean isRunning() {
-        return coreController != null && coreController.getIsRunning();
+        // Do not contend with the native startLoop handshake. The callback and
+        // lifecycle methods keep this state current without blocking callers.
+        return running.get();
     }
 
-    public static void startLoop(String configJson, int tunFd) throws Exception {
+    public static synchronized void startLoop(String configJson, int tunFd) throws Exception {
         if (coreController == null) {
             throw new IllegalStateException("Xray core not initialized");
         }
         if (coreController.getIsRunning()) {
+            running.set(false);
             coreController.stopLoop();
         }
         Log.i(TAG, "Starting Xray loop, tunFd=" + tunFd);
         coreController.startLoop(configJson, tunFd);
         if (!coreController.getIsRunning()) {
+            running.set(false);
             throw new IllegalStateException("Xray core failed to start");
         }
+        running.set(true);
     }
 
-    public static void stopLoop() {
+    public static synchronized void stopLoop() {
         if (coreController == null) return;
         try {
             if (coreController.getIsRunning()) {
                 coreController.stopLoop();
             }
-        } catch (Exception e) {
+        } catch (Exception | LinkageError e) {
             Log.e(TAG, "Failed to stop Xray core", e);
+        } finally {
+            running.set(false);
         }
     }
 
@@ -121,13 +135,53 @@ public final class XrayCoreManager {
         }
     }
 
-    public static long queryStats(String tag, String direction) {
+    public static synchronized String queryAllOutboundTrafficStats() {
+        if (coreController == null || !coreController.getIsRunning()) return "";
+        try {
+            return coreController.queryAllOutboundTrafficStats();
+        } catch (Exception | LinkageError e) {
+            return "";
+        }
+    }
+
+    public static synchronized long queryStats(String tag, String direction) {
         if (coreController == null || !coreController.getIsRunning()) return 0;
         try {
-            return coreController.queryStats(tag, direction);
-        } catch (Exception e) {
+            String allStats = coreController.queryAllOutboundTrafficStats();
+            if (allStats == null || allStats.trim().isEmpty()) return 0;
+            allStats = allStats.trim();
+            if (allStats.startsWith("{")) {
+                try {
+                    org.json.JSONObject obj = new org.json.JSONObject(allStats);
+                    if (obj.has(tag)) {
+                        org.json.JSONObject tagObj = obj.optJSONObject(tag);
+                        if (tagObj != null && tagObj.has(direction)) {
+                            return tagObj.optLong(direction, 0);
+                        }
+                    }
+                    java.util.Iterator<String> keys = obj.keys();
+                    while (keys.hasNext()) {
+                        String k = keys.next();
+                        if (k.contains(tag) && k.contains(direction)) {
+                            return obj.optLong(k, 0);
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+            for (String line : allStats.split("[\\r\\n]+")) {
+                if (line.contains(tag) && line.contains(direction)) {
+                    String[] parts = line.split("[:=]");
+                    if (parts.length > 1) {
+                        try {
+                            return Long.parseLong(parts[parts.length - 1].trim());
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            }
+        } catch (Exception | LinkageError e) {
             return 0;
         }
+        return 0;
     }
 
     public static String getVersion() {
@@ -140,7 +194,7 @@ public final class XrayCoreManager {
 
     /** Prevent proxy outbound from looping through the VPN interface. */
     public static boolean protectSocket(int fd) {
-        VpnService svc = vpnService;
+        VpnService svc = vpnServiceRef.get();
         if (svc == null) return false;
         try {
             return svc.protect(fd);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Xray from './plugins/xray';
 import { ViewState, V2RayConfig, DnsServer } from './types';
 import { getAppValue, getJsonValue, removeAppValue, setAppValue, setJsonValue } from './utils/appStorage';
@@ -10,7 +10,6 @@ import { compareVersions, fetchLatestRelease, formatVersion, GITHUB_OWNER, GITHU
 import { startVpn } from './utils/vpnControl';
 import { isNativeRuntime, runtimePlatform } from './utils/platform';
 import { Capacitor } from '@capacitor/core';
-import { invalidateMeasurements } from './utils/mobileSelection';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewState>('dashboard');
@@ -53,14 +52,6 @@ export default function App() {
     const timer = setInterval(refresh, 3000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [mobile]);
-
-  useEffect(() => {
-    if (!mobile || !isStorageHydrated || networkKey === 'unknown') return;
-    setConfigs(previous => {
-      const next = previous.map(config => invalidateMeasurements(config, measurementContext));
-      return next.every((config, index) => config === previous[index]) ? previous : next;
-    });
-  }, [mobile, isStorageHydrated, measurementContext, networkKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -134,6 +125,8 @@ export default function App() {
     }
   }, [activeDns, isStorageHydrated]);
 
+  const initialStatusSyncedRef = useRef(false);
+
   useEffect(() => {
     if (!isNativeRuntime()) return;
 
@@ -141,7 +134,12 @@ export default function App() {
       try {
         const status = await Xray.getStatus();
         setIsConnected(status.running);
-        if (status.activeConfigId) setActiveConfigId(status.activeConfigId);
+        if (!initialStatusSyncedRef.current) {
+          initialStatusSyncedRef.current = true;
+          if (status.running && status.activeConfigId) {
+            setActiveConfigId(status.activeConfigId);
+          }
+        }
         setAppValue('vpn_last_state', (status.desired ?? status.running) ? '1' : '0').catch(error => {
           console.warn('Could not persist VPN state:', error);
         });

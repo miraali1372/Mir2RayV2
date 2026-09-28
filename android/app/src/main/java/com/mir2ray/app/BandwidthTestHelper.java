@@ -28,6 +28,10 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SNIHostName;
@@ -228,37 +232,57 @@ final class BandwidthTestHelper {
 
                 if (delayOnly) {
                     List<String> delayUrls = collectDelayUrls(payload, downloadUrl);
-                    List<Long> targetDelays = new ArrayList<>(delayUrls.size());
+                    if (delayUrls.isEmpty()) {
+                        delayUrls = new ArrayList<>();
+                        for (String u : TimeoutConstants.DEFAULT_REAL_DELAY_URLS) delayUrls.add(u);
+                    }
+
+                    int probeCount = delayUrls.size();
+                    ExecutorService delayPool = Executors.newFixedThreadPool(Math.min(probeCount, 3));
+                    List<Future<BandwidthSample>> delayFutures = new ArrayList<>(probeCount);
+                    int remaining = remainingTimeoutMs(delayDeadlineNanos);
+                    int probeTimeout = Math.min(remaining, Math.max(1500, timeoutMs));
+
+                    for (String targetUrl : delayUrls) {
+                        final String probeUrl = targetUrl;
+                        delayFutures.add(delayPool.submit(() -> {
+                            try {
+                                return measureHttpDelay(proxy, probeUrl, probeTimeout, DELAY_SAMPLE_COUNT);
+                            } catch (Exception e) {
+                                Log.w(TAG, "Delay probe target failed: " + probeUrl + " (" + e.getMessage() + ")");
+                                return null;
+                            }
+                        }));
+                    }
+                    delayPool.shutdown();
+
+                    List<Long> targetDelays = new ArrayList<>(probeCount);
+                    List<String> successfulUrls = new ArrayList<>(probeCount);
                     long bytesRead = 0;
                     long coldDelayMs = 0;
                     long jitterMs = 0;
-                    for (int index = 0; index < delayUrls.size(); index++) {
-                        int remaining = remainingTimeoutMs(delayDeadlineNanos);
-                        if (remaining <= 200) break;
-                        int targetsLeft = delayUrls.size() - index;
-                        int targetTimeout = Math.min(remaining, Math.max(900, remaining / targetsLeft));
+
+                    for (int i = 0; i < probeCount; i++) {
                         try {
-                            BandwidthSample delay = measureHttpDelay(
-                                    proxy,
-                                    delayUrls.get(index),
-                                    targetTimeout,
-                                    DELAY_SAMPLE_COUNT
-                            );
-                            bytesRead += delay.bytes;
-                            targetDelays.add(delay.ms);
-                            coldDelayMs = Math.max(coldDelayMs, delay.coldMs);
-                            jitterMs = Math.max(jitterMs, delay.jitterMs);
-                            break;
+                            BandwidthSample delay = delayFutures.get(i).get(probeTimeout + 500L, TimeUnit.MILLISECONDS);
+                            if (delay != null && delay.ms >= 0) {
+                                targetDelays.add(delay.ms);
+                                successfulUrls.add(delayUrls.get(i));
+                                bytesRead += delay.bytes;
+                                coldDelayMs = Math.max(coldDelayMs, delay.coldMs);
+                                jitterMs = Math.max(jitterMs, delay.jitterMs);
+                            }
                         } catch (Exception e) {
-                            Log.w(TAG, "Delay probe target failed: " + delayUrls.get(index) + " (" + e.getMessage() + ")");
+                            Log.w(TAG, "Delay future failed for " + delayUrls.get(i) + ": " + e.getMessage());
                         }
                     }
+
                     if (targetDelays.isEmpty()) {
                         throw new IOException("All delay probe targets failed");
                     }
                     long worstDelayMs = selectWorstDelayMs(targetDelays);
                     long preferredDelayMs = selectPreferredDelayMs(
-                            delayUrls,
+                            successfulUrls,
                             targetDelays,
                             payload.optString("preferredDelayUrl", "")
                     );
@@ -307,7 +331,7 @@ final class BandwidthTestHelper {
 
                 BandwidthSample upload;
                 try {
-                    upload = measureUpload(proxy, uploadUrl, uploadBytes, Math.min(3000, timeoutMs / 2));
+                    upload = measureUpload(proxy, uploadUrl, uploadBytes, Math.max(6000, timeoutMs));
                 } catch (Exception e) {
                     Log.w(TAG, "Upload probe failed: " + e.getMessage());
                     upload = new BandwidthSample(Math.max(256_000, Math.round(download.bps * 0.35)), 0, download.ms);
@@ -352,7 +376,117 @@ final class BandwidthTestHelper {
         }
     }
 
+    private static final int MULTI_STREAM_COUNT = 3;
+    private static final String[] MULTISTREAM_DOWNLOAD_URLS = TimeoutConstants.MULTISTREAM_DOWNLOAD_URLS;
+
+    /**
+     * Estimate the expected download size for a given URL.
+     * Used to set the minimum-useful-bytes threshold per stream.
+     */
+    private static int estimateExpectedBytes(String url) {
+        if (url == null) return 512 * 1024;
+        // Cloudflare speed test with explicit ?bytes= parameter
+        int idx = url.indexOf("bytes=");
+        if (idx >= 0) {
+            try {
+                String val = url.substring(idx + 6).replaceAll("[^0-9]", "");
+                if (!val.isEmpty()) return Integer.parseInt(val);
+            } catch (NumberFormatException ignored) {}
+        }
+        // Known small assets
+        if (url.contains("generate_204")) return 0;
+        if (url.contains(".png") || url.contains(".jpg") || url.contains(".jpeg")) return 50 * 1024;
+        return 512 * 1024;
+    }
+
+    /**
+     * Multi-stream parallel download — simulates how Instagram / YouTube / Google One
+     * actually fetch content (multiple TCP connections in parallel).  The reported
+     * bandwidth is the aggregate bytes / wall-clock time, which reflects the real
+     * channel capacity the proxy can sustain for media apps.
+     *
+     * Strategy:
+     *   - Open MULTI_STREAM_COUNT (3) independent SOCKS→TLS connections simultaneously.
+     *   - Each downloads from a different CDN URL so they don't share a server-side pipe.
+     *   - All streams start at the same timestamp; we sum bytes and divide by wall time.
+     *   - If fewer than 1 stream succeeds we throw, otherwise we use whatever succeeded.
+     */
     private static BandwidthSample measureDownload(
+            Proxy proxy,
+            String primaryUrl,
+            int timeoutMs,
+            int expectedBytesPerStream
+    ) throws IOException {
+        // Build URL list: primary first, then the preset CDN alternatives
+        List<String> urlCandidates = new ArrayList<>();
+        urlCandidates.add(primaryUrl);
+        for (String u : MULTISTREAM_DOWNLOAD_URLS) {
+            if (!u.equals(primaryUrl)) urlCandidates.add(u);
+        }
+
+        // Assign one URL per stream (cycle through candidates if fewer than streams)
+        final String[] streamUrls = new String[MULTI_STREAM_COUNT];
+        // Per-stream expected bytes derived from URL (not always 512 KB)
+        final int[] streamExpected = new int[MULTI_STREAM_COUNT];
+        for (int i = 0; i < MULTI_STREAM_COUNT; i++) {
+            streamUrls[i] = urlCandidates.get(i % urlCandidates.size());
+            int fromUrl = estimateExpectedBytes(streamUrls[i]);
+            streamExpected[i] = fromUrl > 0 ? fromUrl : expectedBytesPerStream;
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(MULTI_STREAM_COUNT);
+        final AtomicLong totalBytes = new AtomicLong(0);
+        final long started = System.nanoTime();
+        final int streamTimeout = Math.max(2000, timeoutMs - 500);
+
+        @SuppressWarnings("unchecked")
+        Future<Long>[] futures = new Future[MULTI_STREAM_COUNT];
+        for (int i = 0; i < MULTI_STREAM_COUNT; i++) {
+            final String url = streamUrls[i];
+            final int expected = streamExpected[i];
+            futures[i] = pool.submit(() -> {
+                try {
+                    return downloadStream(proxy, url, streamTimeout, expected);
+                } catch (Exception e) {
+                    Log.w(TAG, "Multi-stream worker failed (" + url + "): " + e.getMessage());
+                    return 0L;
+                }
+            });
+        }
+        pool.shutdown();
+
+        int succeeded = 0;
+        for (Future<Long> f : futures) {
+            try {
+                long bytes = f.get(timeoutMs + 500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (bytes > 0) {
+                    totalBytes.addAndGet(bytes);
+                    succeeded++;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Multi-stream future failed: " + e.getMessage());
+            }
+        }
+
+        if (succeeded == 0) {
+            throw new IOException("All multi-stream download workers failed");
+        }
+
+        long elapsedMs = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+        long totalBytesDownloaded = totalBytes.get();
+        // Aggregate minimum: at least 4 KB per successful stream — a very conservative floor.
+        // Each stream enforces its own per-URL minimum; this guards only against total silence.
+        long minimumUseful = (long) succeeded * 4 * 1024;
+        if (totalBytesDownloaded < minimumUseful) {
+            throw new IOException("Too few bytes across all streams: " + totalBytesDownloaded);
+        }
+        // Aggregate BPS = total_bits / wall_clock_seconds
+        long bps = Math.round((totalBytesDownloaded * 8_000.0) / elapsedMs);
+        return new BandwidthSample(bps, totalBytesDownloaded, elapsedMs);
+    }
+
+    /** Single TCP stream download helper used by the multi-stream orchestrator. */
+    private static long downloadStream(
             Proxy proxy,
             String rawUrl,
             int timeoutMs,
@@ -379,25 +513,24 @@ final class BandwidthTestHelper {
                 InputStream in = socket.getInputStream();
                 OutputStream out = socket.getOutputStream();
                 String request = buildGetRequest(target, port, false);
-                long started = System.nanoTime();
                 out.write(request.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
 
                 HttpResponseHead response = readResponseHead(in);
                 if (response.statusCode < 200 || response.statusCode >= 300) {
-                    throw new IOException("Download test failed with HTTP " + response.statusCode);
+                    throw new IOException("Download stream failed with HTTP " + response.statusCode);
                 }
                 long bytesRead = readTransferBody(in, response, expectedBytes, false);
-                long elapsedMs = Math.max(
-                        1,
-                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
-                );
-                long minimumUsefulBytes = Math.min(16 * 1024, Math.max(1024, Math.round(expectedBytes * 0.15)));
+                // Accept any non-empty response — even a small image is a valid data point.
+                // The 15% floor only applies if expectedBytes > 32 KB to avoid rejecting
+                // legitimately small assets (e.g. og-meta-v3.png ~100 KB).
+                long minimumUsefulBytes = expectedBytes > 32 * 1024
+                        ? Math.min(16 * 1024, Math.max(4 * 1024, Math.round(expectedBytes * 0.05)))
+                        : 1024;
                 if (bytesRead < minimumUsefulBytes) {
-                    throw new IOException("Downloaded too few bytes for a bandwidth sample: " + bytesRead);
+                    throw new IOException("Downloaded too few bytes: " + bytesRead + " (expected min " + minimumUsefulBytes + ")");
                 }
-                long bps = Math.round((bytesRead * 8_000.0) / elapsedMs);
-                return new BandwidthSample(bps, bytesRead, elapsedMs);
+                return bytesRead;
             }
         } finally {
             if (!plain.isClosed()) plain.close();
@@ -491,6 +624,11 @@ final class BandwidthTestHelper {
         if (unique.isEmpty() && fallbackUrl != null && !fallbackUrl.trim().isEmpty()) {
             unique.add(fallbackUrl.trim());
         }
+        if (unique.isEmpty()) {
+            for (String u : TimeoutConstants.DEFAULT_REAL_DELAY_URLS) {
+                unique.add(u);
+            }
+        }
         return new ArrayList<>(unique);
     }
 
@@ -520,11 +658,16 @@ final class BandwidthTestHelper {
                 }
             }
         }
+        if (!targetDelays.isEmpty()) {
+            List<Long> sorted = new ArrayList<>(targetDelays);
+            Collections.sort(sorted);
+            return sorted.get(sorted.size() / 2);
+        }
         return selectWorstDelayMs(targetDelays);
     }
 
     static boolean isDelayResponseStatus(int statusCode) {
-        return statusCode >= 200 && statusCode < 300;
+        return (statusCode >= 200 && statusCode < 400) || statusCode == 404;
     }
 
     private static BandwidthSample measureUpload(Proxy proxy, String url, int bytes, int timeoutMs) throws IOException {
@@ -563,7 +706,7 @@ final class BandwidthTestHelper {
 
                 InputStream in = socket.getInputStream();
                 OutputStream out = socket.getOutputStream();
-                byte[] chunk = new byte[Math.min(32 * 1024, bytes)];
+                byte[] chunk = new byte[Math.min(64 * 1024, bytes)];
                 long started = System.nanoTime();
                 out.write(headers.getBytes(StandardCharsets.US_ASCII));
                 int remaining = bytes;
@@ -745,7 +888,7 @@ final class BandwidthTestHelper {
     }
 
     private static long drainDelayResponseBody(InputStream in, HttpResponseHead response) throws IOException {
-        return readTransferBody(in, response, 64 * 1024, true);
+        return readTransferBody(in, response, 32 * 1024, false);
     }
 
     private static byte[] readResponseHeaders(InputStream in) throws IOException {
@@ -797,7 +940,7 @@ final class BandwidthTestHelper {
         String hostHeader = port == 443 ? target.getHost() : target.getHost() + ":" + port;
         return "GET " + path + " HTTP/1.1\r\n"
                 + "Host: " + hostHeader + "\r\n"
-                + "User-Agent: Mir2rayV2-Bandwidth\r\n"
+                + "User-Agent: Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36\r\n"
                 + "Accept: */*\r\n"
                 + "Accept-Encoding: identity\r\n"
                 + "Cache-Control: no-store\r\n"

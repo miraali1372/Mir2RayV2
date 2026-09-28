@@ -1,3 +1,25 @@
+// The current network returns HTTP 404 for Google Maven. Add a narrowly
+// scoped fallback to every project's buildscript as well as normal dependency
+// repositories (including Capacitor's imported Android project).
+gradle.beforeProject { project ->
+    project.buildscript.repositories {
+        maven {
+            url = uri('local-maven-repo')
+            content {
+                includeGroup 'com.google.testing.platform'
+                includeModule 'com.google.testing.platform', 'core-proto'
+            }
+        }
+        maven {
+            url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public')
+            content {
+                includeGroupByRegex 'com\\.android(\\..*)?'
+                includeGroupByRegex 'com\\.google\\.gms(\\..*)?'
+            }
+        }
+    }
+}
+
 include ':app'
 include ':capacitor-cordova-android-plugins'
 project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')

@@ -21,7 +21,7 @@ import { progressPercent } from '../utils/progress';
 const DNS_TEST_DOMAIN = getTestHost(CONFIG_DELAY_TEST_URL);
 const DNS_TEST_TIMEOUT_MS = 3500;
 const DNS_CONFIG_DELAY_TIMEOUT_MS = 7000;
-const DNS_DOWNLOAD_TIMEOUT_MS = DEFAULT_DOWNLOAD_TIMEOUT_MS;
+const DNS_DOWNLOAD_TIMEOUT_MS = DEFAULT_DOWNLOAD_TIMEOUT_MS; // 8 s — allows 3-stream parallel download
 const DNS_WORKERS = (() => {
   const cores =
     typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'

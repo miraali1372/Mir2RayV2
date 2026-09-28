@@ -16,7 +16,7 @@ const CONFIG_BANDWIDTH_TEST_LIMIT = 3;
 const DEFAULT_DOWNLOAD_TEST_URL = 'https://cachefly.cachefly.net/1mb.test';
 const DEFAULT_UPLOAD_TEST_URL = 'https://www.gstatic.com/generate_204';
 const DEFAULT_DOWNLOAD_TEST_BYTES = 512 * 1024;
-const DEFAULT_UPLOAD_TEST_BYTES = 1024 * 1024;
+const DEFAULT_UPLOAD_TEST_BYTES = 1280 * 1024;
 const GEO_MIRRORS = {
   geoip: [
     'https://cdn.jsdelivr.net/gh/chocolate4u/Iran-v2ray-rules@release/geoip.dat',
@@ -433,35 +433,41 @@ export class XrayManager {
       const preferredUrl = String(options?.preferredTestUrl || '').trim();
       const samples = await this.runTemporaryCore(payload, async port => {
         const deadline = Date.now() + timeoutMs;
-        const exitIp = await fetchPublicIpThroughHttpProxy(
-          port,
-          Math.min(4500, Math.max(1500, Math.floor(timeoutMs / 3)))
-        );
-        if (!exitIp.ok) throw new Error('Exit IP validation failed');
-        const targetSamples = [];
-        for (let index = 0; index < urls.length; index += 1) {
+        const orderedUrls = preferredUrl && urls.includes(preferredUrl)
+          ? [preferredUrl, ...urls.filter(url => url !== preferredUrl)]
+          : urls;
+        let delaySample = null;
+        for (let index = 0; index < orderedUrls.length; index += 1) {
           const remaining = deadline - Date.now();
-          if (remaining < 1000) throw new Error('Real-delay target deadline exceeded');
-          const targetsLeft = urls.length - index;
+          if (remaining < 500) break;
+          const targetsLeft = orderedUrls.length - index;
           const targetBudget = Math.min(
             remaining,
-            Math.max(2000, Math.floor(remaining / targetsLeft))
+            Math.max(1000, Math.floor(remaining / targetsLeft))
           );
-          const target = urls[index];
-          targetSamples.push({
-            ...await measureHttpsDelayThroughHttpProxy(port, target, {
-              timeoutMs: targetBudget,
-              attempts: 3,
-            }),
-            target,
-          });
+          const target = orderedUrls[index];
+          try {
+            delaySample = {
+              ...await measureHttpsDelayThroughHttpProxy(port, target, {
+                timeoutMs: targetBudget,
+                attempts: 1,
+              }),
+              target,
+            };
+            break;
+          } catch {
+            // Try the next service target within the same overall deadline.
+          }
         }
-        const slowest = selectSlowestDelaySample(targetSamples);
-        if (!slowest || targetSamples.length !== urls.length) {
-          throw new Error('Not every real-delay target responded');
+        if (!delaySample) throw new Error('All real-delay targets failed');
+
+        let exitIp = null;
+        const remaining = deadline - Date.now();
+        if (remaining >= 500) {
+          const result = await fetchPublicIpThroughHttpProxy(port, Math.min(1000, remaining));
+          if (result.ok) exitIp = result.ip;
         }
-        const preferred = selectPreferredDelaySample(targetSamples, preferredUrl) || slowest;
-        return { preferred, slowest, exitIp: exitIp.ok ? exitIp.ip : null };
+        return { preferred: delaySample, slowest: delaySample, exitIp };
       });
       const ok = samples.preferred.ok
         && samples.slowest.ok

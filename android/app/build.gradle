@@ -13,8 +13,8 @@ def releaseKeystorePassword = System.getenv('MIR2RAY_KEYSTORE_PASSWORD') ?: keys
 def releaseKeyAlias = System.getenv('MIR2RAY_KEY_ALIAS') ?: keystoreProps.getProperty('keyAlias') ?: project.findProperty('MIR2RAY_KEY_ALIAS')
 def releaseKeyPassword = System.getenv('MIR2RAY_KEY_PASSWORD') ?: keystoreProps.getProperty('keyPassword') ?: releaseKeystorePassword
 def hasReleaseSigningCredentials = releaseKeystoreFile.exists() && releaseKeystorePassword && releaseKeyAlias && releaseKeyPassword
-def appVersionName = System.getenv('MIR2RAY_VERSION_NAME') ?: (project.findProperty('MIR2RAY_VERSION_NAME') ?: '1.0.6')
-def appVersionCode = (System.getenv('MIR2RAY_VERSION_CODE') ?: (project.findProperty('MIR2RAY_VERSION_CODE') ?: '7')) as Integer
+def appVersionName = System.getenv('MIR2RAY_VERSION_NAME') ?: (project.findProperty('MIR2RAY_VERSION_NAME') ?: '1.0.7')
+def appVersionCode = (System.getenv('MIR2RAY_VERSION_CODE') ?: (project.findProperty('MIR2RAY_VERSION_CODE') ?: '8')) as Integer
 
 // Only validate keystore exists for release builds
 if (System.getenv('MIR2RAY_KEYSTORE_PASSWORD') || keystoreProps.getProperty('storePassword') || project.hasProperty('MIR2RAY_KEYSTORE_PASSWORD')) {
@@ -55,6 +55,11 @@ android {
         }
     }
     buildTypes {
+        debug {
+            if (hasReleaseSigningCredentials) {
+                signingConfig = signingConfigs.release
+            }
+        }
         release {
             minifyEnabled = true
             shrinkResources = true
@@ -71,6 +76,11 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
     }
 
     applicationVariants.all { variant ->

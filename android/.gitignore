@@ -32,6 +32,11 @@ proguard/
 # Log Files
 *.log
 
+# Signing secrets — never commit these
+keystore.properties
+*.jks
+*.keystore
+
 # Android Studio Navigation editor temp files
 .navigation/
 

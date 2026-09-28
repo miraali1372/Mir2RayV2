@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Android emulator regression",
+			"type": "shell",
+			"command": ".\\android\\gradlew.bat",
+			"args": [
+				"-p",
+				"android",
+				":app:connectedDebugAndroidTest",
+				{ "value": "-Pandroid.aapt2FromMavenOverride=C:\\Users\\AvangRayan\\AppData\\Local\\Android\\Sdk\\build-tools\\36.0.0\\aapt2.exe", "quoting": "strong" },
+				{ "value": "-Pandroid.testInstrumentationRunnerArguments.liveProxy=vless://00000000-0000-4000-8000-000000000001@10.0.2.2:24081", "quoting": "strong" },
+				"--console=plain"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}

@@ -205,6 +205,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       downloadBps,
       uploadBps,
       bandwidthTestedAt: stamp,
+      measurementKey: configMeasurementKey(config, measurementContext),
       failStreak: 0,
       lastSuccessAt: stamp,
     }, stamp);
@@ -511,22 +512,22 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         fakeDns: fakeDnsEnabled,
         doh: dohEnabled,
         strictDns: false,
-        timeoutMs: 2500,
+        timeoutMs: 5000,
         maxLatencyMs: -1,
         testUrls: CONFIG_REAL_DELAY_TEST_URLS,
         preferredTestUrl: META_REAL_DELAY_TEST_URL,
       });
-      if (result.ok && typeof result.latency === 'number' && result.latency > 0 && result.exitIp) {
+      if (result.ok && typeof result.latency === 'number' && result.latency > 0) {
         realLatency = result.latency;
-        exitIp = result.exitIp;
-        exitCountry = result.exitCountry;
+        exitIp = result.exitIp || conf.exitIp;
+        exitCountry = result.exitCountry || conf.exitCountry;
       }
     } catch (error) {
       console.warn('Single config real delay probe failed for', conf.id, error);
     }
 
-    // Purge immediately if Real Delay timed out or missing exit IP
-    if (typeof realLatency !== 'number' || realLatency <= 0 || !exitIp) {
+    // Purge immediately if Real Delay timed out
+    if (typeof realLatency !== 'number' || realLatency <= 0) {
       setConfigs(prev => prev.filter(c => c.id !== conf.id));
       if (activeConfigId === conf.id) setActiveConfigId(null);
       return;
@@ -693,8 +694,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       }
       setConfigs(rankConfigsByRealDelay(Array.from(aliveMap.values())));
 
-      // Use 8 concurrent workers on mobile, 10 on desktop for maximum throughput without contention
-      const REAL_WORKERS = Math.min(mobile ? 8 : 10, Math.max(2, tcpSurviving.length));
+      const REAL_WORKERS = Math.min(10, Math.max(2, tcpSurviving.length));
       let nextRealIdx = 0;
       let completedRealCount = 0;
       let verifiedRealCount = 0;
@@ -733,7 +733,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
               fragment: conf.fragment,
               fakeDns: fakeDnsEnabled,
               doh: dohEnabled,
-              timeoutMs: 2500,
+              timeoutMs: 5000,
               maxLatencyMs: -1,
               testUrls: CONFIG_REAL_DELAY_TEST_URLS,
               preferredTestUrl: META_REAL_DELAY_TEST_URL,
@@ -882,8 +882,8 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         const result = await Xray.measureConfigBandwidth({
           config: serializeVpnPayload(payload),
         });
-        if (!result.ok || result.downloadBps <= 0 || result.uploadBps <= 0) return 'error';
-        return { downloadBps: result.downloadBps, uploadBps: result.uploadBps };
+        if (!result.ok || result.downloadBps <= 0) return 'error';
+        return { downloadBps: result.downloadBps, uploadBps: Math.max(0, result.uploadBps) };
       } catch (error) {
         console.warn('Bandwidth test failed for config', conf.id, error);
         return 'error';

@@ -335,6 +335,10 @@ public class XrayPlugin extends Plugin {
     @PluginMethod
     public void stopVpn(PluginCall call) {
         try {
+            new SecureStorage(getContext()).putString("mir2ray_vpn_last_state", "0");
+        } catch (Exception ignored) {}
+
+        try {
             Intent serviceIntent = new Intent(getContext(), Mir2RayVpnService.class);
             serviceIntent.setAction(Mir2RayVpnService.ACTION_STOP);
             getContext().startService(serviceIntent);
@@ -387,7 +391,7 @@ public class XrayPlugin extends Plugin {
         ret.put("validated", running);
         ret.put("starting", Mir2RayVpnService.isStarting());
         ret.put("desired", Mir2RayVpnService.isDesired());
-        ret.put("activeConfigId", Mir2RayVpnService.getActiveConfigId());
+        ret.put("activeConfigId", (running || Mir2RayVpnService.isStarting()) ? Mir2RayVpnService.getActiveConfigId() : "");
         ret.put("lastError", Mir2RayVpnService.getLastStartError());
         ret.put("version", XrayCoreManager.getVersion());
         call.resolve(ret);

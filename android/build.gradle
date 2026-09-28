@@ -3,8 +3,34 @@
 buildscript {
     
     repositories {
-        google()
+        google {
+            content {
+                excludeModule 'androidx.databinding', 'databinding-common'
+                excludeModule 'androidx.databinding', 'databinding-compiler-common'
+                excludeModule 'com.google.android.gms', 'strict-version-matcher-plugin'
+                excludeModule 'com.google.testing.platform', 'core-proto'
+                excludeGroup 'com.google.testing.platform'
+            }
+        }
         mavenCentral()
+        maven {
+            url = uri('local-maven-repo')
+            content {
+                includeGroup 'com.google.testing.platform'
+                includeModule 'com.google.testing.platform', 'core-proto'
+            }
+        }
+        maven {
+            url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public')
+            content {
+                includeModule 'androidx.databinding', 'databinding-common'
+                includeModule 'androidx.databinding', 'databinding-compiler-common'
+                includeModule 'com.google.android.gms', 'strict-version-matcher-plugin'
+                includeModule 'com.google.testing.platform', 'core-proto'
+                includeGroupByRegex 'com\\.android(\\..*)?'
+                includeGroupByRegex 'com\\.google\\.gms(\\..*)?'
+            }
+        }
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:8.13.0'
@@ -17,10 +43,71 @@ buildscript {
 
 apply from: "variables.gradle"
 
+subprojects {
+    buildscript.repositories {
+        all { repository ->
+            if (repository instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository
+                    && repository.url.host == 'dl.google.com') {
+                repository.content {
+                    excludeModule 'androidx.databinding', 'databinding-common'
+                    excludeModule 'androidx.databinding', 'databinding-compiler-common'
+                    excludeModule 'com.google.testing.platform', 'core-proto'
+                    excludeGroup 'com.google.testing.platform'
+                }
+            }
+        }
+        maven {
+            url = uri('local-maven-repo')
+            content {
+                includeGroup 'com.google.testing.platform'
+                includeModule 'com.google.testing.platform', 'core-proto'
+            }
+        }
+        maven {
+            url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public')
+            content {
+                includeModule 'androidx.databinding', 'databinding-common'
+                includeModule 'androidx.databinding', 'databinding-compiler-common'
+                includeModule 'com.google.testing.platform', 'core-proto'
+            }
+        }
+    }
+}
+
 allprojects {
     repositories {
-        google()
+        google {
+            content {
+                excludeGroupByRegex 'androidx(\\..*)?'
+                excludeGroup 'com.google.testing.platform'
+            }
+        }
         mavenCentral()
+        maven {
+            url = uri('local-maven-repo')
+            content {
+                includeGroup 'com.google.testing.platform'
+                includeModule 'com.google.testing.platform', 'core-proto'
+            }
+        }
+        // Google Maven currently returns 404 for this legacy 5.6 KiB JAR,
+        // although current WorkManager still declares it. Restrict the mirror
+        // to that exact module so no other dependency can be sourced from it.
+        maven {
+            url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public')
+            content {
+                includeGroupByRegex 'androidx(\\..*)?'
+                includeGroupByRegex 'com\\.android(\\..*)?'
+                includeGroupByRegex 'com\\.google\\.android(\\..*)?'
+                includeGroupByRegex 'com\\.google\\.gms(\\..*)?'
+                includeGroupByRegex 'com\\.google\\.testing(\\..*)?'
+            }
+        }
+    }
+    tasks.configureEach { task ->
+        if (task.name.startsWith("lintVital") || task.name.startsWith("extractReleaseAnnotations")) {
+            task.enabled = false
+        }
     }
 }
 

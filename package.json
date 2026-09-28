@@ -1,7 +1,7 @@
 {
   "name": "mir2rayv2",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Portable Mir2rayV2 client for Android and Windows",
   "author": "Mir2rayV2",
   "main": "desktop/main.mjs",

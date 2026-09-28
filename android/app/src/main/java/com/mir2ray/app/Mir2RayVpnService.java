@@ -56,7 +56,12 @@ public class Mir2RayVpnService extends VpnService {
     private static volatile String activeConfigId = "";
 
     public static boolean isDesired() { return desired; }
-    public static String getActiveConfigId() { return activeConfigId; }
+    public static String getActiveConfigId() {
+        if (!XrayCoreManager.isRunning() && !starting) {
+            return "";
+        }
+        return activeConfigId;
+    }
 
     private static volatile long activeStartId = -1L;
     private static volatile boolean starting = false;
@@ -116,6 +121,7 @@ public class Mir2RayVpnService extends VpnService {
         String action = intent != null ? intent.getAction() : null;
         if (ACTION_STOP.equals(action)) {
             desired = false;
+            activeConfigId = "";
             VpnHealth.reset();
             persistDesired(false);
             activeStartId = -1L;
@@ -368,6 +374,7 @@ public class Mir2RayVpnService extends VpnService {
     private static void markStartFailed(long startIdToken, String message) {
         if (activeStartId == startIdToken || activeStartId < 0) {
             starting = false;
+            activeConfigId = "";
             lastStartError = message != null && !message.isEmpty() ? message : "VPN start failed";
             connectedAtMs = 0L;
         }
@@ -607,6 +614,7 @@ public class Mir2RayVpnService extends VpnService {
         running = false;
         starting = false;
         connectedAtMs = 0L;
+        if (!desired) activeConfigId = "";
         XrayCoreManager.stopLoop();
 
         if (vpnInterface != null) {
@@ -728,6 +736,7 @@ public class Mir2RayVpnService extends VpnService {
     public void onDestroy() {
         destroyed = true;
         desired = false;
+        activeConfigId = "";
         VpnHealth.reset();
         if (monitor != null) monitor.shutdownNow();
         activeStartId = -1L;
@@ -751,6 +760,7 @@ public class Mir2RayVpnService extends VpnService {
         Log.i(TAG, "VPN permission revoked by the system/user");
         desired = false;
         persistDesired(false);
+        activeConfigId = "";
         VpnHealth.reset();
         activeStartId = -1L;
         starting = false;

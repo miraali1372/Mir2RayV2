@@ -1,8 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Capacitor } from '@capacitor/core';
-import { connectionCandidates, invalidateMeasurements, screenMobileConfigs } from '../utils/mobileSelection';
-import { buildVpnStartPayload } from '../utils/vpnPayload';
-import { CONFIG_REAL_DELAY_TEST_URLS } from '../constants/testTargets';
 import { motion, AnimatePresence } from 'motion/react';
 import { Power, Activity, X, Share2, Copy, Check, RefreshCw } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
@@ -10,7 +7,7 @@ import { V2RayConfig, DnsServer } from '../types';
 import { generateExportUri } from '../utils';
 import { removeAppValue, setAppValue } from '../utils/appStorage';
 import Xray from '../plugins/xray';
-import { annotateConfigQuality, configMeasurementKey, hasFreshVerification, isConnectableConfig, recordConfigFailure } from '../utils/profileQuality';
+import { annotateConfigQuality, configMeasurementKey, isConnectableConfig, recordConfigFailure } from '../utils/profileQuality';
 import { startVpn } from '../utils/vpnControl';
 import { isNativeRuntime } from '../utils/platform';
 
@@ -325,7 +322,6 @@ export function Dashboard({
       routingMode: 'global',
       allowedApps: [],
       disallowedApps: [],
-      recoveryConfigs: mobile ? connectionCandidates(configs).slice(0, 5) : undefined,
     });
     if (!result.success) {
       throw new Error(result.error || 'VPN start failed');
@@ -388,50 +384,14 @@ export function Dashboard({
         throw new Error('کانفیگ فعالی انتخاب نشده است.');
       }
 
-      if (mobile) {
-        window.dispatchEvent(new Event('mir2ray-stop-tests'));
-        await Xray.cancelConfigTests();
-        let candidates = connectionCandidates(configs.map(config => invalidateMeasurements(config, measurementContext)), activeConfig.id);
-        if (!candidates.some(hasFreshVerification)) {
-          const measured: V2RayConfig[] = [];
-          await screenMobileConfigs({
-            configs: candidates, context: measurementContext, targetCount: 1, budgetMs: 3_500, workers: 6,
-            stopped: () => contextRef.current !== measurementContext,
-            probe: config => Xray.measureConfigDelay({
-              ...buildVpnStartPayload(config, activeDns, { fakeDns: fakeDnsEnabled, doh: dohEnabled }),
-              timeoutMs: 2000, maxLatencyMs: -1, testUrls: CONFIG_REAL_DELAY_TEST_URLS,
-            }),
-            onResult: result => {
-              measured.push(result);
-              setConfigs(previous => previous.map(config => config.id === result.id ? result : config));
-            },
-          });
-          candidates = connectionCandidates(measured);
-        }
-        const verified = candidates.filter(hasFreshVerification).slice(0, 3);
-        let connected = false;
-        for (const candidate of verified) {
-          try {
-            await startVpnForConfig(candidate);
-            connected = true;
-            break;
-          } catch {
-            await Xray.stopVpn();
-            setConfigs(previous => previous.map(config => config.id === candidate.id ? recordConfigFailure(config) : config));
-          }
-        }
-        if (!connected && activeConfig) {
-          try {
-            await startVpnForConfig(activeConfig);
-            connected = true;
-          } catch {
-            await Xray.stopVpn();
-            setConfigs(previous => previous.map(config => config.id === activeConfig.id ? recordConfigFailure(config) : config));
-          }
-        }
-        if (!connected) throw new Error('در این نوبت مسیر سالم پیدا نشد. کانفیگ‌ها حفظ شدند؛ دوباره امتحان کنید.');
-      } else {
+      // Always connect ONLY to the user's explicitly selected activeConfig!
+      try {
         await startVpnForConfig(activeConfig);
+      } catch (activeErr) {
+        console.warn('Selected active config failed to start:', activeErr);
+        await Xray.stopVpn();
+        setConfigs(previous => previous.map(config => config.id === activeConfig.id ? recordConfigFailure(config) : config));
+        throw activeErr;
       }
     } catch (err: unknown) {
       console.error('Failed to start VPN via native plugin', err);
@@ -530,12 +490,19 @@ export function Dashboard({
 
       <div className="w-full glass-panel rounded-2xl p-4 overflow-hidden">
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <div className={`flex items-center gap-2 text-sm font-semibold ${isConnected ? 'text-emerald-300' : isConnecting ? 'text-cyan-300' : 'text-zinc-300'}`}>
               <span className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-400 shadow-[0_0_14px_rgba(52,211,153,0.8)]' : isConnecting ? 'bg-cyan-400 animate-pulse' : 'bg-zinc-500'}`} />
               {connectionLabel}
             </div>
-            <p className="mt-1 text-[11px] text-zinc-500 truncate">{connectionHint}</p>
+            {activeConfig ? (
+              <p className="mt-1 text-[11px] text-zinc-400 truncate flex items-center gap-1.5" dir="ltr">
+                <span className="text-cyan-400 font-semibold truncate max-w-[200px]">{activeConfig.name}</span>
+                <span className="text-zinc-500 text-[10px]">({activeConfig.type})</span>
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-zinc-500 truncate">{connectionHint}</p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             {activeConfig && (

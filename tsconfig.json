@@ -21,6 +21,25 @@
       ]
     },
     "allowImportingTsExtensions": true,
-    "noEmit": true
-  }
+    "noEmit": true,
+    // Strict mode for better type safety (but not too strict to break existing code)
+    "strict": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    // Additional checks
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true
+    // Note: noUnusedLocals and noUnusedParameters disabled to avoid noise in existing code
+    // Note: noUncheckedIndexedAccess disabled as it requires significant refactoring
+  },
+  "include": [
+    "src",
+    "*.ts",
+    "*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "android/**/build"
+  ]
 }

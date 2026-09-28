@@ -1,2 +1,14 @@
 /build/*
 !/build/.npmkeep
+
+# Keystore files - never commit these!
+keystore.properties
+release-keystore.jks
+*.jks
+*.keystore
+
+# Google services
+google-services.json
+
+# Local properties
+local.properties

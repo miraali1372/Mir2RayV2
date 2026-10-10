@@ -768,7 +768,7 @@ final class BandwidthTestHelper {
         if (lower.contains("facebook.com") || lower.contains("instagram.com") || lower.contains("cdninstagram.com")) {
             return "social";
         }
-        if (lower.contains("google.com") || lower.contains("gstatic.com")) {
+        if (lower.contains("google.com") || lower.contains("gstatic.com") || lower.contains("googleapis.com")) {
             return "web";
         }
         if (lower.contains("cloudflare.com") || lower.contains("cachefly.net")) {

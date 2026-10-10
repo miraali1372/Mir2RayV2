@@ -19,13 +19,14 @@ export default function App() {
   const [activeConfigId, setActiveConfigId] = useState<string | null>(null);
   const [activeDns, setActiveDns] = useState<DnsServer | null>(null);
   const [isStorageHydrated, setIsStorageHydrated] = useState(false);
+  const configPersistenceQueueRef = useRef(Promise.resolve());
 
   // App-level VPN state to keep it alive across unmounts
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [uptime, setUptime] = useState(0);
   const [globalOperation, setGlobalOperation] = useState(false);
-  const [currentVersion, setCurrentVersion] = useState('1.0.1');
+  const [currentVersion, setCurrentVersion] = useState('1.0.9');
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
@@ -92,9 +93,12 @@ export default function App() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (!isStorageHydrated) return;
-    setJsonValue('configs', configs).catch(error => {
-      console.warn('Could not persist configs:', error);
-    });
+    configPersistenceQueueRef.current = configPersistenceQueueRef.current
+      .catch(() => undefined)
+      .then(() => setJsonValue('configs', configs))
+      .catch(error => {
+        console.warn('Could not persist configs:', error);
+      });
   }, [configs, isStorageHydrated]);
 
   useEffect(() => {

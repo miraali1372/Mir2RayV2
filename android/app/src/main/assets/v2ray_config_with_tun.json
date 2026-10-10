@@ -37,7 +37,7 @@
       "protocol": "tun",
       "settings": {
         "name": "xray0",
-        "MTU": 1500,
+        "MTU": 1280,
         "userLevel": 8
       },
       "sniffing": {
@@ -63,6 +63,10 @@
       "mux": { "enabled": false }
     },
     {
+      "tag": "dns-out",
+      "protocol": "dns"
+    },
+    {
       "tag": "direct",
       "protocol": "freedom",
       "settings": { "domainStrategy": "UseIPv4" }
@@ -70,12 +74,26 @@
     {
       "tag": "block",
       "protocol": "blackhole",
-      "settings": { "response": { "type": "http" } }
+      "settings": { "response": { "type": "none" } }
     }
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["tun"],
+        "network": "udp",
+        "port": 53,
+        "outboundTag": "dns-out"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["tun"],
+        "network": "udp",
+        "port": 443,
+        "outboundTag": "block"
+      },
       {
         "type": "field",
         "inboundTag": ["tun"],

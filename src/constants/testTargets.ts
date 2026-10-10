@@ -3,6 +3,8 @@ import { DestinationPolicy } from '../types';
 export const YOUTUBE_DELAY_TEST_URL = 'https:\x2f\x2fwww.youtube.com/generate_204';
 export const GOOGLE_DELAY_TEST_URL = 'https:\x2f\x2fwww.google.com/generate_204';
 export const INSTAGRAM_DELAY_TEST_URL = 'https:\x2f\x2fwww.facebook.com/generate_204';
+export const AI_STUDIO_DELAY_TEST_URL = 'https:\x2f\x2fgenerativelanguage.googleapis.com/v1beta/models';
+export const AI_STUDIO_TEST_URL = AI_STUDIO_DELAY_TEST_URL;
 
 export const CONFIG_DELAY_TEST_URL = GOOGLE_DELAY_TEST_URL;
 export const CONFIG_REAL_DELAY_TEST_URL = CONFIG_DELAY_TEST_URL;
@@ -18,6 +20,7 @@ export const TARGET_KEY_GOOGLE = 'google';
 export const TARGET_KEY_YOUTUBE = 'youtube';
 export const TARGET_KEY_META = 'meta';
 export const TARGET_KEY_INSTAGRAM = 'instagram';
+export const TARGET_KEY_AI_STUDIO = 'aiStudio';
 export const TARGET_KEY_DOWNLOAD = 'download';
 export const TARGET_KEY_CLOUDFLARE = 'cloudflare';
 
@@ -26,6 +29,7 @@ export const TARGET_KEYS = {
   YOUTUBE: TARGET_KEY_YOUTUBE,
   META: TARGET_KEY_META,
   INSTAGRAM: TARGET_KEY_INSTAGRAM,
+  AI_STUDIO: TARGET_KEY_AI_STUDIO,
   DOWNLOAD: TARGET_KEY_DOWNLOAD,
   CLOUDFLARE: TARGET_KEY_CLOUDFLARE,
 } as const;
@@ -37,6 +41,7 @@ export const TARGET_URLS_BY_KEY: Record<string, string> = {
   youtube: YOUTUBE_DELAY_TEST_URL,
   meta: META_REAL_DELAY_TEST_URL,
   instagram: INSTAGRAM_DELAY_TEST_URL,
+  aiStudio: AI_STUDIO_DELAY_TEST_URL,
   download: 'https:\x2f\x2fspeed.cloudflare.com/__down?bytes=524288',
   cloudflare: 'https:\x2f\x2fspeed.cloudflare.com/__down?bytes=524288',
 };

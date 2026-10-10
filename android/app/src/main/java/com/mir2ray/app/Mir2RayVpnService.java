@@ -458,7 +458,7 @@ public class Mir2RayVpnService extends VpnService {
         try {
             // Try adaptive MTU values: prefer the last MTU that worked on this device (cached),
             // then 1500, with fallbacks to lower MTUs for mobile networks.
-            int[] mtuCandidates = conservativeMtu ? new int[] {1280} : orderMtuCandidates(readCachedMtu(), new int[] {1420, 1280});
+            int[] mtuCandidates = conservativeMtu ? new int[] {1280} : orderMtuCandidates(readCachedMtu(), new int[] {1280, 1360});
 
             for (int mtu : mtuCandidates) {
                 try {

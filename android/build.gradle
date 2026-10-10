@@ -105,7 +105,7 @@ allprojects {
         }
     }
     tasks.configureEach { task ->
-        if (task.name.startsWith("lintVital") || task.name.startsWith("extractReleaseAnnotations")) {
+        if (task.name.startsWith("lintVital") || task.name.startsWith("extractReleaseAnnotations") || task.name == "syncReleaseLibJars") {
             task.enabled = false
         }
     }

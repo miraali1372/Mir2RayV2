@@ -119,6 +119,7 @@ public class BandwidthTestHelperTest {
         assertEquals("social", BandwidthTestHelper.determineTier("https://static.cdninstagram.com/rsrc.php/v3/yA/r/"));
         assertEquals("web", BandwidthTestHelper.determineTier("https://www.google.com/generate_204"));
         assertEquals("web", BandwidthTestHelper.determineTier("https://connectivitycheck.gstatic.com/generate_204"));
+        assertEquals("web", BandwidthTestHelper.determineTier("https://generativelanguage.googleapis.com/v1beta/models"));
         assertEquals("cdn", BandwidthTestHelper.determineTier("https://cp.cloudflare.com/generate_204"));
         assertEquals("standard", BandwidthTestHelper.determineTier("https://example.com/check"));
         assertEquals("standard", BandwidthTestHelper.determineTier(null));

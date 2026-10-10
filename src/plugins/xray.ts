@@ -1,5 +1,19 @@
 import { registerPlugin, WebPlugin } from '@capacitor/core';
-import { FragmentSettings } from '../types';
+import { DestinationProbeResult, FragmentSettings, ProbeDestination } from '../types';
+
+export interface MeasureConfigDelayResult {
+  latency: number;
+  worstLatency?: number;
+  coldLatency?: number;
+  jitter?: number;
+  ok: boolean;
+  exitIp?: string;
+  exitCountry?: string;
+  exitCountryProvenance?: 'measured' | 'inferred' | 'unknown';
+  destinationResults?: Partial<Record<ProbeDestination, DestinationProbeResult>>;
+  targetResults?: DestinationProbeResult[];
+  message?: string;
+}
 
 export interface XrayPlugin {
   startVpn(options: { config: string }): Promise<{ status: string; version?: string; message?: string; confirmed?: boolean; connectedAtMs?: number }>;
@@ -24,7 +38,7 @@ export interface XrayPlugin {
   }>;
   downloadAndInstallApk(options: { url: string; fileName?: string }): Promise<{ ok: boolean; message?: string; path?: string }>;
   pingHost(options: { host: string; port?: number; timeout?: number }): Promise<{ latency: number; ok: boolean; ip?: string }>;
-  getCurrentPublicIp(options?: { timeoutMs?: number }): Promise<{ ip: string; ok: boolean; source: 'vpn' | 'direct'; message?: string }>;
+  getCurrentPublicIp(options?: { timeoutMs?: number }): Promise<{ ip: string; ok: boolean; source: 'vpn' | 'direct'; country?: string; message?: string }>;
   testDnsResolve(options: {
     dnsIp: string;
     domain?: string;
@@ -74,7 +88,7 @@ export interface XrayPlugin {
     fragment?: FragmentSettings;
     fakeDns?: boolean;
     doh?: boolean;
-  }): Promise<{ latency: number; worstLatency?: number; coldLatency?: number; jitter?: number; ok: boolean; exitIp?: string; exitCountry?: string }>;
+  }): Promise<MeasureConfigDelayResult>;
   measureConfigBandwidth(options: {
     config: string;
     bytes?: number;
@@ -90,6 +104,9 @@ export interface XrayPlugin {
     downloadMs: number;
     uploadMs: number;
     ok: boolean;
+    exitIp?: string;
+    exitCountry?: string;
+    exitCountryProvenance?: 'measured' | 'inferred' | 'unknown';
     message?: string;
   }>;
   measureConfigDownload(options: {

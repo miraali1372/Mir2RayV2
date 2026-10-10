@@ -264,8 +264,16 @@ export function computeConfigQuality(config: V2RayConfig): ConfigQuality {
   // 2. Download Speed Score (0 to 35 pts)
   let downloadScore = 0;
   if (hasDownload) {
-    const mbps = (config.downloadBps as number) / 1_000_000;
-    downloadScore = Math.max(3, Math.min(35, Math.round(35 * mbps / (mbps + 2.5))));
+    const bps = config.downloadBps as number;
+    if (bps < 100_000) {
+      // Bandwidth under 100 kbps is throttled/blocked
+      downloadScore = 0;
+    } else {
+      const mbps = bps / 1_000_000;
+      downloadScore = Math.max(3, Math.min(35, Math.round(35 * mbps / (mbps + 2.5))));
+    }
+  } else if (config.downloadBps === 'error') {
+    downloadScore = -15;
   } else if (isRealVerified) {
     downloadScore = 15;
   }
@@ -273,15 +281,22 @@ export function computeConfigQuality(config: V2RayConfig): ConfigQuality {
   // 3. Upload Speed Score (0 to 12 pts)
   let uploadScore = 0;
   if (hasUpload) {
-    const mbps = (config.uploadBps as number) / 1_000_000;
-    uploadScore = Math.max(1, Math.min(12, Math.round(12 * mbps / (mbps + 1.2))));
+    const bps = config.uploadBps as number;
+    if (bps < 50_000) {
+      uploadScore = 0;
+    } else {
+      const mbps = bps / 1_000_000;
+      uploadScore = Math.max(1, Math.min(12, Math.round(12 * mbps / (mbps + 1.2))));
+    }
+  } else if (config.uploadBps === 'error') {
+    uploadScore = -10;
   } else if (isRealVerified) {
     uploadScore = 5;
   }
 
   // 4. Reliability & Verification Score (0 to 8 pts)
   let reliabilityScore = 0;
-  const failPenalty = Math.min(18, Math.max(0, config.failStreak ?? 0) * 6);
+  const failPenalty = Math.min(25, Math.max(0, config.failStreak ?? 0) * 8);
   if (isRealVerified) {
     reliabilityScore = 8 - failPenalty;
   } else if (typeof config.tcpPing === 'number') {
@@ -290,11 +305,22 @@ export function computeConfigQuality(config: V2RayConfig): ConfigQuality {
 
   const fresh = hasFreshVerification(config);
   const ageFactor = fresh ? 1 : 0.35;
-  const jitterPenalty = Math.min(8, Math.max(0, config.jitter ?? 0) / 30);
+  const jitterVal = Math.max(0, config.jitter ?? 0);
+  const jitterPenalty = jitterVal > 500
+    ? 22
+    : jitterVal > 250
+      ? 14
+      : Math.min(8, jitterVal / 30);
   const rawScore = (latencyScore + downloadScore + uploadScore + reliabilityScore - jitterPenalty) * ageFactor;
   const score = Math.max(0, Math.min(100, Math.round(rawScore)));
+
+  const hasBlockedBandwidth = config.downloadBps === 'error'
+    || (typeof config.downloadBps === 'number' && config.downloadBps < 100_000 && bandwidthFresh);
+  const severePacketLoss = (config.failStreak ?? 0) >= 3;
   const usable = score > 0 && fresh && (config.retryAfter ?? 0) <= Date.now()
-    && config.ping !== 'error' && config.realDelay !== 'error';
+    && config.ping !== 'error' && config.realDelay !== 'error'
+    && !hasBlockedBandwidth
+    && !severePacketLoss;
 
   return {
     score,

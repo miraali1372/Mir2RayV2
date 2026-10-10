@@ -390,6 +390,14 @@ public final class V2rayConfigBuilder {
         }
         JSONArray rules = new JSONArray();
 
+        // 0) Route UDP/53 (DNS) to internal DNS outbound (dns-out) so DNS queries never bottleneck or drop in tunnel.
+        rules.put(new JSONObject()
+                .put("type", "field")
+                .put("inboundTag", buildRoutingInboundTags(inboundTag))
+                .put("network", "udp")
+                .put("port", 53)
+                .put("outboundTag", "dns-out"));
+
         // 1) QUIC over a TCP-backed proxy can stall before the app retries HTTP/2.
         // Route UDP/443 to the local block outbound so that fallback happens promptly.
         rules.put(new JSONObject()

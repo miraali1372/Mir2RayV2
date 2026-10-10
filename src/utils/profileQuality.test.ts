@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { configMeasurementKey } from './profileQuality';
+import { isSuccessfulConfigTest, isValidLatency, retainSuccessfulConfigTests } from './configTestResults';
 import { connectionCandidates, invalidateMeasurements, screenMobileConfigs } from './mobileSelection';
 import { V2RayConfig } from '../types';
 import {
@@ -43,6 +44,17 @@ function config(overrides: Partial<V2RayConfig>): V2RayConfig {
     ...overrides,
   };
 }
+
+test('failed timeout and invalid measurements are removed from the final test set', () => {
+  const good = config({ id: 'good', tcpPing: 80, realDelay: 120, ping: 120 });
+  const timeout = config({ id: 'timeout', tcpPing: 'error', realDelay: 'error', ping: 'error' });
+  const invalid = config({ id: 'invalid', tcpPing: Number.NaN, realDelay: Number.POSITIVE_INFINITY, ping: 0 });
+  assert.equal(isValidLatency(good.tcpPing), true);
+  assert.equal(isValidLatency(Number.NaN), false);
+  assert.equal(isSuccessfulConfigTest(good), true);
+  assert.equal(isSuccessfulConfigTest(timeout), false);
+  assert.deepEqual(retainSuccessfulConfigTests([good, timeout, invalid]).map(item => item.id), ['good']);
+});
 
 test('Instagram ranking follows TCP and then Meta real delay before bandwidth exists', () => {
   const tcpRanked = rankConfigsForInstagram([
@@ -406,3 +418,128 @@ test('pickBestConfig with destination and fail-closed country policy', () => {
   const legacyPick = pickBestConfig([germanInferred, germanMeasured]);
   assert.ok(legacyPick);
 });
+
+test('tightened quality algorithm rejects configs with high jitter, packet loss, or blocked bandwidth', () => {
+  const stamp = new Date().toISOString();
+  // Config with high jitter (> 500ms) gets heavy penalty
+  const normalConfig = config({
+    id: 'normal',
+    realDelay: 150,
+    ping: 150,
+    downloadBps: 5_000_000,
+    uploadBps: 2_000_000,
+    lastSuccessAt: stamp,
+    jitter: 30,
+  });
+  const highJitterConfig = config({
+    id: 'high-jitter',
+    realDelay: 150,
+    ping: 150,
+    downloadBps: 5_000_000,
+    uploadBps: 2_000_000,
+    lastSuccessAt: stamp,
+    jitter: 650,
+  });
+  assert.ok(computeConfigQuality(normalConfig).score > computeConfigQuality(highJitterConfig).score);
+
+  // Severe packet loss (failStreak >= 3) marks config as not usable
+  const packetLossConfig = config({
+    id: 'packet-loss',
+    realDelay: 150,
+    ping: 150,
+    lastSuccessAt: stamp,
+    failStreak: 3,
+  });
+  assert.equal(computeConfigQuality(packetLossConfig).usable, false);
+
+  // Blocked / throttled bandwidth (< 100 kbps) marks config as not usable
+  const throttledConfig = config({
+    id: 'throttled',
+    realDelay: 150,
+    ping: 150,
+    downloadBps: 40_000, // 40 kbps < 100 kbps
+    bandwidthTestedAt: stamp,
+    lastSuccessAt: stamp,
+  });
+  assert.equal(computeConfigQuality(throttledConfig).usable, false);
+
+  // Bandwidth test error marks config as not usable
+  const bwErrorConfig = config({
+    id: 'bw-error',
+    realDelay: 150,
+    ping: 150,
+    downloadBps: 'error',
+    lastSuccessAt: stamp,
+  });
+  assert.equal(computeConfigQuality(bwErrorConfig).usable, false);
+});
+
+test('Google AI Studio region check and real L7 endpoint verification', async () => {
+  const {
+    isAiStudioBlockedCountry,
+    isGoogleAiStudioRegion,
+    hasAiStudioVerified,
+    AI_STUDIO_TEST_URL,
+    YOUTUBE_TEST_URL,
+  } = await import('../views/Profiles');
+
+  // Verify real L7 endpoint is used instead of fake generate_204
+  assert.equal(AI_STUDIO_TEST_URL, 'https://generativelanguage.googleapis.com/v1beta/models');
+  assert.ok(!AI_STUDIO_TEST_URL.includes('generate_204'));
+
+  // Iran, China, Russia, etc. must be strictly blocked from AI Studio
+  assert.equal(isAiStudioBlockedCountry('IR'), true);
+  assert.equal(isAiStudioBlockedCountry('CN'), true);
+  assert.equal(isAiStudioBlockedCountry('RU'), true);
+  assert.equal(isAiStudioBlockedCountry('DE'), false);
+  assert.equal(isAiStudioBlockedCountry('US'), false);
+
+  assert.equal(isGoogleAiStudioRegion('IR'), false);
+  assert.equal(isGoogleAiStudioRegion('DE'), true);
+  assert.equal(isGoogleAiStudioRegion('US'), true);
+
+  const stamp = new Date().toISOString();
+  // Config with exitCountry IR must NEVER get hasAiStudioVerified
+  const iranConfig = {
+    ...config({ id: 'ir-cfg', realDelay: 120, ping: 120, exitCountry: 'IR' }),
+    destinationEvidence: {
+      aiStudio: { ok: true, latency: 120, testedAt: stamp },
+      youtube: { ok: true, latency: 120, testedAt: stamp },
+    },
+    targetEvidence: {
+      [AI_STUDIO_TEST_URL]: { ok: true, latency: 120, testedAt: stamp },
+      [YOUTUBE_TEST_URL]: { ok: true, latency: 120, testedAt: stamp },
+    },
+  };
+  assert.equal(hasAiStudioVerified(iranConfig as any), false);
+
+  // Config with exitCountry DE and passing evidence succeeds
+  const germanConfig = {
+    ...config({ id: 'de-cfg', realDelay: 120, ping: 120, exitCountry: 'DE' }),
+    destinationEvidence: {
+      aiStudio: { ok: true, latency: 120, testedAt: stamp },
+      youtube: { ok: true, latency: 120, testedAt: stamp },
+    },
+    targetEvidence: {
+      [AI_STUDIO_TEST_URL]: { ok: true, latency: 120, testedAt: stamp },
+      [YOUTUBE_TEST_URL]: { ok: true, latency: 120, testedAt: stamp },
+    },
+  };
+  assert.equal(hasAiStudioVerified(germanConfig as any), true);
+
+  // If evidence failed (even with German exit IP), AI Studio is not verified
+  const germanFailedEvidence = {
+    ...germanConfig,
+    destinationEvidence: {
+      aiStudio: { ok: false, latency: -1, testedAt: stamp },
+      youtube: { ok: true, latency: 120, testedAt: stamp },
+    },
+    targetEvidence: {
+      [AI_STUDIO_TEST_URL]: { ok: false, latency: -1, testedAt: stamp },
+      [YOUTUBE_TEST_URL]: { ok: true, latency: 120, testedAt: stamp },
+    },
+  };
+  assert.equal(hasAiStudioVerified(germanFailedEvidence as any), false);
+});
+
+

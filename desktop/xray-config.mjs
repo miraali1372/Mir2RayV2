@@ -259,8 +259,9 @@ function commonConfig(outbounds, dnsIp, strictDns, doh) {
     inbounds: [],
     outbounds: [
       ...outbounds,
+      { tag: 'dns-out', protocol: 'dns' },
       { tag: 'direct', protocol: 'freedom', settings: { domainStrategy: 'UseIPv4' } },
-      { tag: 'block', protocol: 'blackhole', settings: { response: { type: 'http' } } },
+      { tag: 'block', protocol: 'blackhole', settings: { response: { type: 'none' } } },
     ],
     routing: { domainStrategy: 'IPIfNonMatch', rules: [] },
     dns: { hosts: {}, servers: dnsServers(dnsIp, strictDns, doh), queryStrategy: 'UseIPv4' },
@@ -270,8 +271,9 @@ function commonConfig(outbounds, dnsIp, strictDns, doh) {
 function proxyRoutingRules(inboundTags, balanced) {
   const target = balanced ? { balancerTag: 'best5' } : { outboundTag: 'proxy' };
   return [
-    // QUIC over a TCP-backed proxy can stall before the app retries HTTP/2.
-    // Route UDP/443 to the local block outbound so that fallback happens promptly.
+    // 1) Route UDP/53 (DNS) to internal DNS outbound so DNS queries resolve reliably without bottleneck
+    { type: 'field', inboundTag: inboundTags, network: 'udp', port: 53, outboundTag: 'dns-out' },
+    // 2) QUIC over UDP/443: drop cleanly with blackhole type none for instant browser fallback to TCP
     { type: 'field', inboundTag: inboundTags, network: 'udp', port: 443, outboundTag: 'block' },
     { type: 'field', inboundTag: inboundTags, ip: PRIVATE_CIDRS, outboundTag: 'direct' },
     { type: 'field', inboundTag: inboundTags, domain: IRAN_DIRECT_DOMAINS, outboundTag: 'direct' },
@@ -319,7 +321,7 @@ export function buildMainConfig(payload, ports = {}) {
     {
       tag: 'tun', protocol: 'tun',
       settings: {
-        name: 'mir2ray', desc: 'Mir2rayV2', mtu: 1500,
+        name: 'mir2ray', desc: 'Mir2rayV2', mtu: 1280,
         gateway: ['172.19.0.1/30', 'fd00:19::1/126'], dns: interfaceDns,
         autoSystemRoutingTable: ['0.0.0.0/0', '::/0'], autoOutboundsInterface: 'auto', userLevel: 8,
       },

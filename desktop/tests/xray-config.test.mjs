@@ -47,17 +47,28 @@ test('builds Windows full-tunnel configuration with automatic routes and stats A
   });
   const tun = config.inbounds.find(item => item.protocol === 'tun');
   assert.ok(tun);
+  assert.equal(tun.settings.mtu, 1280);
   assert.deepEqual(tun.settings.autoSystemRoutingTable, ['0.0.0.0/0', '::/0']);
   assert.equal(tun.settings.autoOutboundsInterface, 'auto');
   assert.equal(config.api.services[0], 'StatsService');
   assert.ok(config.routing.rules.some(rule => rule.inboundTag?.includes('api') && rule.outboundTag === 'api'));
+
+  const dnsOutBound = config.outbounds.find(o => o.tag === 'dns-out');
+  assert.ok(dnsOutBound);
+  const blockOutbound = config.outbounds.find(o => o.tag === 'block');
+  assert.equal(blockOutbound?.settings?.response?.type, 'none');
+
+  const dnsRuleIndex = config.routing.rules.findIndex(rule =>
+    rule.port === 53 && rule.network === 'udp' && rule.outboundTag === 'dns-out'
+  );
   const quicBlockIndex = config.routing.rules.findIndex(rule =>
     rule.port === 443 && rule.network === 'udp' && rule.outboundTag === 'block'
   );
   const proxyIndex = config.routing.rules.findIndex(rule =>
     rule.inboundTag?.includes('tun') && rule.network === 'tcp,udp' && rule.outboundTag === 'proxy'
   );
-  assert.ok(quicBlockIndex >= 0);
+  assert.ok(dnsRuleIndex >= 0);
+  assert.ok(quicBlockIndex > dnsRuleIndex);
   assert.ok(proxyIndex > quicBlockIndex);
 });
 

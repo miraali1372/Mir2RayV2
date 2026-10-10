@@ -1,7 +1,7 @@
 {
   "name": "mir2rayv2",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.9",
   "description": "Portable Mir2rayV2 client for Android and Windows",
   "author": "Mir2rayV2",
   "main": "desktop/main.mjs",
@@ -18,7 +18,8 @@
     "desktop:electron": "powershell -ExecutionPolicy Bypass -File scripts/install-electron-runtime.ps1",
     "desktop:run": "npm run build && electron .",
     "test:desktop": "node --test desktop/tests/*.test.mjs && tsx --test src/utils/profileQuality.test.ts",
-    "build:windows:portable": "npm run lint && npm run test:desktop && npm run build && npm run desktop:electron && npm run desktop:runtime && electron-builder --win portable --x64"
+    "build:windows:portable": "npm run lint && npm run test:desktop && npm run build && npm run desktop:electron && npm run desktop:runtime && electron-builder --win portable --x64",
+    "build:electron": "npm run build:windows:portable"
   },
   "dependencies": {
     "@capacitor/android": "^8.4.2",
@@ -75,11 +76,11 @@
     "win": {
       "target": ["portable"],
       "icon": "output/imagegen/mir2rayv2-icon-transparent.png",
-      "requestedExecutionLevel": "asInvoker",
+      "requestedExecutionLevel": "requireAdministrator",
       "artifactName": "Mir2rayV2-${version}-Windows-Portable.${ext}"
     },
     "portable": {
-      "requestExecutionLevel": "user",
+      "requestExecutionLevel": "admin",
       "unpackDirName": true,
       "artifactName": "Mir2rayV2-${version}-Windows-Portable.${ext}"
     }

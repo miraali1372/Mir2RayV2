@@ -5,7 +5,10 @@ import { screenMobileConfigs } from '../utils/mobileSelection';
 import { ClipboardPaste, Trash2, CheckCircle2, Zap, Smartphone, Hash, Navigation as NavIcon, Link as LinkIcon, X, Download, Activity, Gauge } from 'lucide-react';
 import { DnsServer, V2RayConfig } from '../types';
 import { parseV2rayUri, splitConfigLines, testLatencyReal, testLatencyAndIp } from '../utils';
-import { getDisplayCountry, extractCountryFromName } from '../utils/country';
+import {
+  getDisplayCountry,
+  resolveCountryFromCode,
+} from '../utils/country';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import Xray from '../plugins/xray';
 import { buildVpnStartPayload, serializeVpnPayload } from '../utils/vpnPayload';
@@ -14,10 +17,12 @@ import {
   DEFAULT_DOWNLOAD_TIMEOUT_MS,
   DOWNLOAD_TEST_BYTES,
   DOWNLOAD_TEST_URL,
+  GOOGLE_DELAY_TEST_URL,
   META_REAL_DELAY_TEST_URL,
   MIN_CONFIG_BANDWIDTH_BPS,
   UPLOAD_TEST_BYTES,
   UPLOAD_TEST_URL,
+  YOUTUBE_DELAY_TEST_URL,
 } from '../constants/testTargets';
 import {
   annotateConfigQuality,
@@ -30,10 +35,127 @@ import {
   rankConfigsByDownloadSpeed,
   configMeasurementKey,
   hasFreshVerification,
+  recordConfigFailure,
+  isMeasurementFresh,
 } from '../utils/profileQuality';
 import { progressPercent } from '../utils/progress';
 import { fetchTextResource } from '../utils/platformFetch';
 import { isWindowsDesktop } from '../utils/platform';
+
+// Google AI Studio (Gemini) Region Eligibility
+const AI_STUDIO_BLOCKED_COUNTRIES = new Set([
+  'IR', 'CN', 'RU', 'BY', 'CU', 'KP', 'SY',
+]);
+
+export function isAiStudioBlockedCountry(countryCode?: string): boolean {
+  if (!countryCode) return true;
+  return AI_STUDIO_BLOCKED_COUNTRIES.has(countryCode.trim().toUpperCase());
+}
+
+export function isGoogleAiStudioRegion(countryCode?: string): boolean {
+  if (!countryCode) return false;
+  const upper = countryCode.trim().toUpperCase();
+  if (AI_STUDIO_BLOCKED_COUNTRIES.has(upper)) return false;
+  return /^[A-Z]{2}$/.test(upper);
+}
+
+export const YOUTUBE_TEST_URL = YOUTUBE_DELAY_TEST_URL;
+export const AI_STUDIO_TEST_URL = 'https:\x2f\x2faistudio.google.com/generate_204';
+export const META_TEST_URL = META_REAL_DELAY_TEST_URL;
+export const GOOGLE_TEST_URL = GOOGLE_DELAY_TEST_URL;
+
+export const REQUIRED_REAL_DELAY_URLS: readonly string[] = [
+  YOUTUBE_TEST_URL,
+  AI_STUDIO_TEST_URL,
+  META_TEST_URL,
+  GOOGLE_TEST_URL,
+];
+
+export interface DestinationTargetEvidence {
+  ok: boolean;
+  latency?: number;
+  testedAt?: string;
+  statusCode?: number;
+  error?: string;
+}
+
+export interface DestinationEvidence {
+  youtube?: DestinationTargetEvidence;
+  aiStudio?: DestinationTargetEvidence;
+  meta?: DestinationTargetEvidence;
+  google?: DestinationTargetEvidence;
+  [targetUrl: string]: DestinationTargetEvidence | undefined;
+}
+
+export interface ExtendedV2RayConfig extends V2RayConfig {
+  destinationEvidence?: DestinationEvidence;
+  targetEvidence?: Record<string, DestinationTargetEvidence>;
+  evidence?: Record<string, DestinationTargetEvidence>;
+  aiStudioCompatible?: boolean;
+}
+
+export function toExtendedConfig(base: V2RayConfig, overrides: Partial<ExtendedV2RayConfig>): V2RayConfig {
+  return {
+    ...base,
+    ...overrides,
+  } as ExtendedV2RayConfig as V2RayConfig;
+}
+
+export function isConfigEligible(config: ExtendedV2RayConfig, now = Date.now()): boolean {
+  if (!config.type || (config.type !== 'vless' && config.type !== 'vmess' && config.type !== 'trojan' && config.type !== 'shadowsocks')) {
+    return false;
+  }
+  if (config.rawUri && (config.type === 'vless' || config.type === 'trojan') && config.rawUri.toLowerCase().includes('security=none')) {
+    return false;
+  }
+  if (typeof config.realDelay !== 'number' || config.realDelay <= 0) {
+    return false;
+  }
+  if (config.ping === 'error') {
+    return false;
+  }
+  if ((config.retryAfter ?? 0) > now) {
+    return false;
+  }
+  // Exit country must be strictly measured (never inferred from name) and in allowed Google AI Studio region
+  if (!config.exitCountry || !isGoogleAiStudioRegion(config.exitCountry) || isAiStudioBlockedCountry(config.exitCountry)) {
+    return false;
+  }
+  const countryMeasurementTime = config.latencyTestedAt || config.lastSuccessAt || config.verifiedAt;
+  if (!isMeasurementFresh(countryMeasurementTime, undefined, now)) {
+    return false;
+  }
+  // Fresh YouTube destination evidence required
+  const ytEvidence = config.destinationEvidence?.youtube || config.targetEvidence?.[YOUTUBE_TEST_URL] || config.evidence?.[YOUTUBE_TEST_URL];
+  if (!ytEvidence || !ytEvidence.ok || !isMeasurementFresh(ytEvidence.testedAt, undefined, now)) {
+    return false;
+  }
+  // Fresh AI Studio destination evidence required
+  const aiEvidence = config.destinationEvidence?.aiStudio || config.targetEvidence?.[AI_STUDIO_TEST_URL] || config.evidence?.[AI_STUDIO_TEST_URL];
+  if (!aiEvidence || !aiEvidence.ok || !isMeasurementFresh(aiEvidence.testedAt, undefined, now)) {
+    return false;
+  }
+  return true;
+}
+
+export function pickBestEligibleConfig(configs: ExtendedV2RayConfig[], now = Date.now()): ExtendedV2RayConfig | null {
+  const eligible = configs.filter(c => isConfigEligible(c, now));
+  if (eligible.length === 0) return null;
+  return pickBestConfig(eligible) || eligible[0] || null;
+}
+
+export function hasAiStudioVerified(config: ExtendedV2RayConfig, now = Date.now()): boolean {
+  if (!config.exitCountry || !isGoogleAiStudioRegion(config.exitCountry) || isAiStudioBlockedCountry(config.exitCountry)) {
+    return false;
+  }
+  const aiEvidence = config.destinationEvidence?.aiStudio
+    || config.targetEvidence?.[AI_STUDIO_TEST_URL]
+    || config.evidence?.[AI_STUDIO_TEST_URL];
+  if (!aiEvidence || !aiEvidence.ok) {
+    return false;
+  }
+  return isMeasurementFresh(aiEvidence.testedAt, undefined, now);
+}
 
 const TCP_CONFIG_TEST_WORKERS = 64;
 const TCP_CONFIG_TEST_TIMEOUT_MS = 1500;
@@ -49,15 +171,15 @@ const BANDWIDTH_TEST_WORKERS = 3;
 const SUBSCRIPTION_SOURCES = [
   {
     name: 'MirSub2',
-    url: 'https://raw.githubusercontent.com/miraali1372/mirsub2/main/subscription.txt',
+    url: 'https:\x2f\x2fraw.githubusercontent.com/miraali1372/mirsub2/main/subscription.txt',
   },
   {
     name: 'vmess',
-    url: 'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt',
+    url: 'https:\x2f\x2fraw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt',
   },
   {
     name: 'mirsub',
-    url: 'https://raw.githubusercontent.com/miraali1372/mirsub/main/subscription.txt',
+    url: 'https:\x2f\x2fraw.githubusercontent.com/miraali1372/mirsub/main/subscription.txt',
   },
 ] as const;
 const CONFIG_RESULT_FLUSH_INTERVAL_MS = 700;
@@ -211,7 +333,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     }, stamp);
   };
 
-  const bestConfig = pickBestConfig(configs);
+  const bestConfig = pickBestEligibleConfig(configs as ExtendedV2RayConfig[]);
 
   useEffect(() => {
     if (isPingingAll || isDownloadTesting || isFetchingSub || isBulkImporting || globalOperation) {
@@ -233,7 +355,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
   ]);
 
   const selectBestConfig = () => {
-    const best = pickBestConfig(configs);
+    const best = pickBestEligibleConfig(configs as ExtendedV2RayConfig[]);
     if (!best) return;
     setActiveConfigId(best.id);
     setConfigs(prev => rankConfigsForInstagram(prev.map(config => annotateConfigQuality(config))));
@@ -303,7 +425,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         if (!res.ok) throw new Error(res.message || `HTTP ${res.status}`);
         let text = res.text;
         
-        if (!text.includes('://')) {
+        if (!text.includes(':\x2f\x2f')) {
             try {
                text = atob(text);
             } catch(e) {
@@ -492,17 +614,23 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
     const tcpRes = await testLatencyAndIp(conf.cleanIp || conf.address, conf.port || 443, 1200);
     const tcpLatency = tcpRes.latency;
 
-    // Purge immediately if TCP timed out, failed, or missing IP
+    // Record failure and backoff on TCP failure - NEVER DELETE
     if (typeof tcpLatency !== 'number' || tcpLatency < 0 || !tcpRes.ip) {
-      setConfigs(prev => prev.filter(c => c.id !== conf.id));
-      if (activeConfigId === conf.id) setActiveConfigId(null);
+      setConfigs(prev => prev.map(c => c.id === conf.id ? {
+        ...recordConfigFailure(c),
+        tcpPing: 'error',
+      } : c));
       return;
     }
 
-    // 2. Real Delay test + Exit IP
+    // 2. Real Delay test with required URLs + Exit IP & Country (YouTube first)
+    const nowIso = new Date().toISOString();
     let realLatency: number | 'error' = 'error';
     let exitIp: string | undefined = undefined;
     let exitCountry: string | undefined = undefined;
+    let ytEvidence: DestinationTargetEvidence = { ok: false, testedAt: nowIso };
+    let aiEvidence: DestinationTargetEvidence = { ok: false, testedAt: nowIso };
+
     try {
       const result = await Xray.measureConfigDelay({
         shareUri: conf.rawUri,
@@ -512,39 +640,118 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         fakeDns: fakeDnsEnabled,
         doh: dohEnabled,
         strictDns: false,
-        timeoutMs: 5000,
+        timeoutMs: 4000,
         maxLatencyMs: -1,
-        testUrls: CONFIG_REAL_DELAY_TEST_URLS,
-        preferredTestUrl: META_REAL_DELAY_TEST_URL,
+        testUrl: YOUTUBE_TEST_URL,
+        testUrls: REQUIRED_REAL_DELAY_URLS,
+        preferredTestUrl: YOUTUBE_TEST_URL,
       });
       if (result.ok && typeof result.latency === 'number' && result.latency > 0) {
         realLatency = result.latency;
         exitIp = result.exitIp || conf.exitIp;
         exitCountry = result.exitCountry || conf.exitCountry;
+        ytEvidence = {
+          ok: true,
+          latency: result.latency,
+          testedAt: nowIso,
+        };
       }
     } catch (error) {
       console.warn('Single config real delay probe failed for', conf.id, error);
     }
 
-    // Purge immediately if Real Delay timed out
+    // Record failure and backoff on Real Delay failure - NEVER DELETE
     if (typeof realLatency !== 'number' || realLatency <= 0) {
-      setConfigs(prev => prev.filter(c => c.id !== conf.id));
-      if (activeConfigId === conf.id) setActiveConfigId(null);
+      setConfigs(prev => prev.map(c => c.id === conf.id ? toExtendedConfig(recordConfigFailure(c), {
+        tcpPing: tcpLatency,
+        resolvedIp: tcpRes.ip,
+        destinationEvidence: {
+          ...((c as ExtendedV2RayConfig).destinationEvidence || {}),
+          youtube: ytEvidence,
+        },
+        targetEvidence: {
+          ...((c as ExtendedV2RayConfig).targetEvidence || {}),
+          [YOUTUBE_TEST_URL]: ytEvidence,
+        },
+      }) : c));
       return;
     }
 
+    // 3. Test Google AI Studio destination if exit country is allowed
+    const isAllowedAiCountry = Boolean(exitCountry && isGoogleAiStudioRegion(exitCountry) && !isAiStudioBlockedCountry(exitCountry));
+    if (isAllowedAiCountry) {
+      try {
+        const aiResult = await Xray.measureConfigDelay({
+          shareUri: conf.rawUri,
+          dnsIp: activeDns?.ip,
+          cleanIp: conf.cleanIp,
+          fragment: conf.fragment,
+          fakeDns: fakeDnsEnabled,
+          doh: dohEnabled,
+          strictDns: false,
+          timeoutMs: 3500,
+          maxLatencyMs: -1,
+          testUrl: AI_STUDIO_TEST_URL,
+          testUrls: REQUIRED_REAL_DELAY_URLS,
+          preferredTestUrl: AI_STUDIO_TEST_URL,
+        });
+        if (aiResult.ok && typeof aiResult.latency === 'number' && aiResult.latency > 0) {
+          aiEvidence = {
+            ok: true,
+            latency: aiResult.latency,
+            testedAt: nowIso,
+          };
+        } else {
+          aiEvidence = {
+            ok: false,
+            testedAt: nowIso,
+          };
+        }
+      } catch {
+        aiEvidence = {
+          ok: false,
+          testedAt: nowIso,
+        };
+      }
+    } else {
+      aiEvidence = {
+        ok: false,
+        testedAt: nowIso,
+        error: exitCountry ? 'Exit country not supported by Google AI Studio' : 'Exit country unknown',
+      };
+    }
+
     setConfigs(prev => {
-      const updated = prev.map(c => c.id === conf.id ? annotateConfigQuality({
-        ...c,
-        tcpPing: tcpLatency,
-        realDelay: realLatency,
-        ping: realLatency,
-        resolvedIp: tcpRes.ip,
-        exitIp: exitIp,
-        exitCountry: exitCountry,
-        latencyTestedAt: new Date().toISOString(),
-        lastSuccessAt: new Date().toISOString(),
-      }) : c);
+      const updated = prev.map(c => {
+        if (c.id !== conf.id) return c;
+        const prevExt = c as ExtendedV2RayConfig;
+        const destinationEvidence: DestinationEvidence = {
+          ...(prevExt.destinationEvidence || {}),
+          youtube: ytEvidence,
+          aiStudio: aiEvidence,
+        };
+        const targetEvidence: Record<string, DestinationTargetEvidence> = {
+          ...(prevExt.targetEvidence || {}),
+          [YOUTUBE_TEST_URL]: ytEvidence,
+          [AI_STUDIO_TEST_URL]: aiEvidence,
+        };
+        return annotateConfigQuality(toExtendedConfig(c, {
+          tcpPing: tcpLatency,
+          realDelay: realLatency,
+          ping: realLatency,
+          resolvedIp: tcpRes.ip,
+          exitIp: exitIp,
+          exitCountry: exitCountry, // strictly from measured tunnel exit evidence, never from name
+          destinationEvidence,
+          targetEvidence,
+          evidence: targetEvidence,
+          aiStudioCompatible: Boolean(aiEvidence.ok && isAllowedAiCountry),
+          latencyTestedAt: nowIso,
+          lastSuccessAt: nowIso,
+          retryAfter: undefined,
+          failStreak: 0,
+        }));
+      });
       return rankConfigsByRealDelay(updated);
     });
   };
@@ -643,22 +850,29 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
             for (const conf of endpoint.configs) {
               const existing = aliveMap.get(conf.id);
               if (existing) {
-                const countryInfo = extractCountryFromName(existing.name);
                 aliveMap.set(conf.id, annotateConfigQuality({
                   ...existing,
                   tcpPing: latency,
                   ping: latency,
                   resolvedIp: resolvedIp,
-                  exitCountry: existing.exitCountry || countryInfo?.code,
+                  // Strictly preserve exitCountry if already measured, never infer from name
                   latencyTestedAt: new Date().toISOString(),
+                  retryAfter: undefined,
+                  failStreak: 0,
                 }));
               }
             }
           } else {
-            // PURGE IMMEDIATELY ON TIMEOUT OR FAILURE
+            // NEVER DELETE PROFILES ON TRANSIENT TCP FAILURE - Record failure & backoff
             for (const conf of endpoint.configs) {
-              aliveMap.delete(conf.id);
-              purgedTcpCount++;
+              const existing = aliveMap.get(conf.id);
+              if (existing) {
+                aliveMap.set(conf.id, {
+                  ...recordConfigFailure(existing),
+                  tcpPing: 'error',
+                });
+                purgedTcpCount++;
+              }
             }
           }
 
@@ -673,11 +887,12 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
 
       if (stopPingRequestedRef.current || !isRunCurrent()) return;
 
-      const tcpSurviving = rankConfigsByTcpLatency(Array.from(aliveMap.values()));
+      const tcpSurviving = Array.from(aliveMap.values()).filter(
+        c => typeof c.tcpPing === 'number' && c.tcpPing >= 0 && Boolean(c.resolvedIp)
+      );
       if (tcpSurviving.length === 0) {
-        setConfigs([]);
-        setActiveConfigId(null);
-        setConfigTestMessage('تمام کانفیگ‌ها در تست TCP یا عدم دریافت IP ناموفق بودند و پاک شدند.');
+        setConfigs(Array.from(aliveMap.values()));
+        setConfigTestMessage('تمام کانفیگ‌ها در تست TCP یا دریافت IP ناموفق بودند؛ خطا و زمان تلاش مجدد ثبت شد.');
         return;
       }
 
@@ -710,7 +925,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         const sortedAlive = rankConfigsByRealDelay(Array.from(aliveMap.values()));
         setConfigs(sortedAlive);
         setConfigTestMessage(
-          `مرحله ۲: تست Real Delay (${verifiedRealCount.toLocaleString('fa-IR')} تأیید شد، ${purgedRealCount.toLocaleString('fa-IR')} حذف شد)...`
+          `مرحله ۲: تست Real Delay (${verifiedRealCount.toLocaleString('fa-IR')} تأیید شد، ${purgedRealCount.toLocaleString('fa-IR')} خطا)...`
         );
       };
 
@@ -721,9 +936,12 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
           if (idx >= tcpSurviving.length) break;
 
           const conf = tcpSurviving[idx];
+          const nowIso = new Date().toISOString();
           let realLatency: number | 'error' = 'error';
           let exitIp: string | undefined = undefined;
           let exitCountry: string | undefined = undefined;
+          let ytEvidence: DestinationTargetEvidence = { ok: false, testedAt: nowIso };
+          let aiEvidence: DestinationTargetEvidence = { ok: false, testedAt: nowIso };
 
           try {
             const result = await Xray.measureConfigDelay({
@@ -733,15 +951,22 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
               fragment: conf.fragment,
               fakeDns: fakeDnsEnabled,
               doh: dohEnabled,
-              timeoutMs: 5000,
+              strictDns: false,
+              timeoutMs: 4000,
               maxLatencyMs: -1,
-              testUrls: CONFIG_REAL_DELAY_TEST_URLS,
-              preferredTestUrl: META_REAL_DELAY_TEST_URL,
+              testUrl: YOUTUBE_TEST_URL,
+              testUrls: REQUIRED_REAL_DELAY_URLS,
+              preferredTestUrl: YOUTUBE_TEST_URL,
             });
             if (result.ok && typeof result.latency === 'number' && result.latency > 0) {
               realLatency = result.latency;
-              exitIp = result.exitIp;
-              exitCountry = result.exitCountry;
+              exitIp = result.exitIp || conf.exitIp;
+              exitCountry = result.exitCountry || conf.exitCountry;
+              ytEvidence = {
+                ok: true,
+                latency: result.latency,
+                testedAt: nowIso,
+              };
             }
           } catch (e) {
             console.warn('Real delay probe failed for', conf.id, e);
@@ -749,28 +974,101 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
 
           if (!isRunCurrent()) break;
 
-          // A config is verified if it successfully tunnels HTTP traffic (realLatency > 0)
           const passed = typeof realLatency === 'number' && realLatency > 0;
+
+          // Probe Google AI Studio destination if exit country is in allowed region
+          const isAllowedAiCountry = Boolean(passed && exitCountry && isGoogleAiStudioRegion(exitCountry) && !isAiStudioBlockedCountry(exitCountry));
+          if (isAllowedAiCountry) {
+            try {
+              const aiResult = await Xray.measureConfigDelay({
+                shareUri: conf.rawUri,
+                dnsIp: activeDns?.ip,
+                cleanIp: conf.cleanIp,
+                fragment: conf.fragment,
+                fakeDns: fakeDnsEnabled,
+                doh: dohEnabled,
+                strictDns: false,
+                timeoutMs: 3500,
+                maxLatencyMs: -1,
+                testUrl: AI_STUDIO_TEST_URL,
+                testUrls: REQUIRED_REAL_DELAY_URLS,
+                preferredTestUrl: AI_STUDIO_TEST_URL,
+              });
+              if (aiResult.ok && typeof aiResult.latency === 'number' && aiResult.latency > 0) {
+                aiEvidence = {
+                  ok: true,
+                  latency: aiResult.latency,
+                  testedAt: nowIso,
+                };
+              } else {
+                aiEvidence = {
+                  ok: false,
+                  testedAt: nowIso,
+                };
+              }
+            } catch {
+              aiEvidence = {
+                ok: false,
+                testedAt: nowIso,
+              };
+            }
+          } else {
+            aiEvidence = {
+              ok: false,
+              testedAt: nowIso,
+              error: exitCountry ? 'Exit country not supported by Google AI Studio' : 'Exit country unknown',
+            };
+          }
 
           if (passed) {
             const existing = aliveMap.get(conf.id);
             if (existing) {
-              const countryInfo = extractCountryFromName(existing.name);
-              aliveMap.set(conf.id, annotateConfigQuality({
-                ...existing,
+              const prevExt = existing as ExtendedV2RayConfig;
+              const destinationEvidence: DestinationEvidence = {
+                ...(prevExt.destinationEvidence || {}),
+                youtube: ytEvidence,
+                aiStudio: aiEvidence,
+              };
+              const targetEvidence: Record<string, DestinationTargetEvidence> = {
+                ...(prevExt.targetEvidence || {}),
+                [YOUTUBE_TEST_URL]: ytEvidence,
+                [AI_STUDIO_TEST_URL]: aiEvidence,
+              };
+              aliveMap.set(conf.id, annotateConfigQuality(toExtendedConfig(existing, {
                 realDelay: realLatency,
                 ping: realLatency,
                 exitIp: exitIp || existing.resolvedIp,
-                exitCountry: exitCountry || existing.exitCountry || countryInfo?.code,
-                latencyTestedAt: new Date().toISOString(),
-                lastSuccessAt: new Date().toISOString(),
-              }));
+                exitCountry: exitCountry, // strictly from measured tunnel exit evidence, never from name
+                destinationEvidence,
+                targetEvidence,
+                evidence: targetEvidence,
+                aiStudioCompatible: Boolean(aiEvidence.ok && isAllowedAiCountry),
+                latencyTestedAt: nowIso,
+                lastSuccessAt: nowIso,
+                retryAfter: undefined,
+                failStreak: 0,
+              })));
               verifiedRealCount++;
             }
           } else {
-            // PURGE IMMEDIATELY IF REAL DELAY TIMED OUT OR FAILED
-            aliveMap.delete(conf.id);
-            purgedRealCount++;
+            // NEVER PURGE ON REAL DELAY FAILURE - Record failure & backoff
+            const existing = aliveMap.get(conf.id);
+            if (existing) {
+              const prevExt = existing as ExtendedV2RayConfig;
+              aliveMap.set(conf.id, toExtendedConfig(recordConfigFailure(existing), {
+                realDelay: 'error',
+                ping: 'error',
+                destinationEvidence: {
+                  ...(prevExt.destinationEvidence || {}),
+                  youtube: ytEvidence,
+                },
+                targetEvidence: {
+                  ...(prevExt.targetEvidence || {}),
+                  [YOUTUBE_TEST_URL]: ytEvidence,
+                },
+              }));
+              purgedRealCount++;
+            }
           }
 
           completedRealCount++;
@@ -784,11 +1082,15 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
 
       if (stopPingRequestedRef.current || !isRunCurrent()) return;
 
-      // Phase 3: Final ranking & auto-select top config
-      const finalRanked = rankConfigsByRealDelay(Array.from(aliveMap.values()));
+      // Phase 3: Final ranking & auto-select top eligible config
+      const allConfigs = Array.from(aliveMap.values());
+      const finalRanked = rankConfigsByRealDelay(allConfigs);
       setConfigs(finalRanked);
 
-      if (finalRanked.length > 0 && finalRanked[0].id) {
+      const topEligible = pickBestEligibleConfig(finalRanked as ExtendedV2RayConfig[]);
+      if (topEligible && topEligible.id) {
+        setActiveConfigId(topEligible.id);
+      } else if (finalRanked.length > 0 && finalRanked[0].id) {
         setActiveConfigId(finalRanked[0].id);
       }
 
@@ -797,7 +1099,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       });
 
       setConfigTestMessage(
-        `تست کامل شد: ${finalRanked.length.toLocaleString('fa-IR')} کانفیگ سالم و باکیفیت تأیید و مرتب شدند؛ تمام موارد تایم‌اوت، بدون IP و ریل‌دیلی حذف شدند.`
+        `تست کامل شد: ${verifiedRealCount.toLocaleString('fa-IR')} کانفیگ سالم تأیید شدند؛ برای ${purgedRealCount + purgedTcpCount} کانفیگ ناموفق بک‌آف ثبت شد.`
       );
     } catch (e) {
       console.warn('Config test pipeline failed', e);
@@ -877,7 +1179,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
           uploadBytes: UPLOAD_TEST_BYTES,
           timeoutMs: testTimeoutMs,
           downloadUrl: DOWNLOAD_TEST_URL,
-          uploadUrl: mobile ? 'https://speed.cloudflare.com/__up' : UPLOAD_TEST_URL,
+          uploadUrl: mobile ? 'https:\x2f\x2fspeed.cloudflare.com/__up' : UPLOAD_TEST_URL,
         };
         const result = await Xray.measureConfigBandwidth({
           config: serializeVpnPayload(payload),
@@ -905,8 +1207,15 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
         if (outcome === 'error' || outcome === 'below-minimum') {
           failed += 1;
           setDownloadTestFailed(failed);
-          // PURGE IMMEDIATELY ON DOWNLOAD FAILURE
-          aliveDownloadMap.delete(conf.id);
+          // NEVER DELETE PROFILES ON DOWNLOAD/BANDWIDTH FAILURE - Record failure & backoff
+          const existing = aliveDownloadMap.get(conf.id);
+          if (existing) {
+            aliveDownloadMap.set(conf.id, {
+              ...recordConfigFailure(existing),
+              downloadBps: 'error',
+              uploadBps: 'error',
+            });
+          }
         } else if (typeof outcome === 'object') {
           const existing = aliveDownloadMap.get(conf.id);
           if (existing) {
@@ -928,7 +1237,10 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
       if (isRunCurrent()) {
         const finalRanked = rankConfigsByDownloadSpeed(Array.from(aliveDownloadMap.values()));
         setConfigs(finalRanked);
-        if (finalRanked.length > 0 && !finalRanked.some(c => c.id === activeConfigId)) {
+        const topEligible = pickBestEligibleConfig(finalRanked as ExtendedV2RayConfig[]);
+        if (topEligible && topEligible.id) {
+          setActiveConfigId(topEligible.id);
+        } else if (finalRanked.length > 0 && !finalRanked.some(c => c.id === activeConfigId)) {
           setActiveConfigId(finalRanked[0].id);
         }
       }
@@ -941,7 +1253,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
   // Limit rendering count so DOM doesn't crash on 60,000 items
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden pt-8 pb-4 px-4">
-      
+
       <div className="mb-3 flex flex-col gap-2">
         <div className="flex flex-col gap-2">
           <div className="flex justify-between items-end">
@@ -950,7 +1262,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
               <p className="text-[11px] text-zinc-500 mt-0.5">مدیریت کانفیگ‌ها و V2Ray Links</p>
             </div>
             <div className="flex flex-wrap justify-end gap-1.5">
-              <button 
+              <button
                 onClick={pingAll}
                 disabled={isPingingAll || isDownloadTesting || configs.length === 0 || !!globalOperation}
                 className="text-[11px] px-2.5 py-1.5 bg-zinc-800/80 hover:bg-zinc-700 rounded-lg flex items-center gap-1.5 border border-zinc-700/50 transition-colors"
@@ -958,7 +1270,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 <Zap size={13} className={isPingingAll ? "animate-pulse text-yellow-400" : "text-zinc-400"} />
                 <span>{isPingingAll ? 'درحال تست' : 'پینگ همه'}</span>
               </button>
-              <button 
+              <button
                 onClick={runDownloadTest}
                 disabled={isDownloadTesting || isPingingAll || configs.length === 0 || !!globalOperation}
                 className="text-[11px] px-2.5 py-1.5 bg-cyan-600/10 hover:bg-cyan-600/20 rounded-lg flex items-center gap-1.5 border border-cyan-500/20 transition-colors text-cyan-300"
@@ -970,7 +1282,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 onClick={selectBestConfig}
                 disabled={!bestConfig || (!mobile && (isPingingAll || isDownloadTesting || !!globalOperation)) || configs.length === 0}
                 className="text-[11px] px-2.5 py-1.5 bg-emerald-600/10 hover:bg-emerald-600/20 rounded-lg flex items-center gap-1.5 border border-emerald-500/20 transition-colors text-emerald-300 disabled:opacity-50 disabled:cursor-not-allowed"
-                title={bestConfig ? `Best score: ${computeConfigQuality(bestConfig).score}` : 'Run tests first'}
+                title={bestConfig ? `بهترین کانفیگ واجد شرایط (YouTube + AI Studio): امتیاز ${computeConfigQuality(bestConfig).score}` : 'نیاز به تست و احراز شواهد YouTube و Google AI Studio'}
               >
                 <Gauge size={13} />
                 <span>بهترین</span>
@@ -986,7 +1298,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 <span>حذف همه</span>
               </button>
               {isPingingAll && (
-                <button 
+                <button
                   onClick={requestStopPing}
                   className="text-[11px] px-2.5 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 rounded-lg flex items-center gap-1.5 border border-rose-500/30 transition-colors text-rose-400"
                 >
@@ -995,7 +1307,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                 </button>
               )}
               {isDownloadTesting && (
-                <button 
+                <button
                   onClick={requestStopDownload}
                   className="text-[11px] px-2.5 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 rounded-lg flex items-center gap-1.5 border border-rose-500/30 transition-colors text-rose-400"
                 >
@@ -1033,7 +1345,7 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
               </div>
               <div className="text-xs text-zinc-400">
                 {downloadTestCompleted.toLocaleString('fa-IR')} / {downloadTestTotal.toLocaleString('fa-IR')} کانفیگ؛ IP خروجی، دانلود و آپلود تست شد ({downloadTestPercent}%)
-                {downloadTestFailed > 0 && ` - ${downloadTestFailed.toLocaleString('fa-IR')} حذف شد`}
+                {downloadTestFailed > 0 && ` - ${downloadTestFailed.toLocaleString('fa-IR')} خطا`}
                 {downloadTestBelowMinimum > 0 && ` (${downloadTestBelowMinimum.toLocaleString('fa-IR')} مورد زیر ۱ Mbps)`}
               </div>
             </div>
@@ -1187,6 +1499,15 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                     >
                       Q {quality.score}
                     </span>
+                    {hasAiStudioVerified(config as ExtendedV2RayConfig) && (
+                      <span
+                        className="shrink-0 text-[9px] font-medium px-1.5 py-0.5 rounded border text-cyan-300 border-cyan-500/30 bg-cyan-950/40"
+                        title="Google AI Studio Verified"
+                        dir="ltr"
+                      >
+                        AI Studio ✓
+                      </span>
+                    )}
                   </div>
 
                   <div className="flex justify-between items-center w-full gap-2 min-w-0">
@@ -1198,9 +1519,11 @@ export function Profiles({ configs, setConfigs, activeConfigId, setActiveConfigI
                        {(config.exitIp || config.resolvedIp) && (
                          <span className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-700/50 flex items-center gap-1" title={`IP: ${config.exitIp || config.resolvedIp}`}>
                            <span>{config.exitIp || config.resolvedIp}</span>
-                           <span className="text-[9px] font-sans text-emerald-200">
-                             {getDisplayCountry(config.exitCountry, config.name)}
-                           </span>
+                           {config.exitCountry && (
+                             <span className="text-[9px] font-sans text-emerald-200">
+                               {getDisplayCountry(config.exitCountry)}
+                             </span>
+                           )}
                          </span>
                        )}
                      </div>

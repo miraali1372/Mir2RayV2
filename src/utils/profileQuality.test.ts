@@ -5,9 +5,32 @@ import { connectionCandidates, invalidateMeasurements, screenMobileConfigs } fro
 import { V2RayConfig } from '../types';
 import {
   computeConfigQuality,
+  createDestinationEvidence,
+  getDestinationEvidence,
+  isConfigEligible,
+  isDestinationEvidencePassing,
   pickBestConfig,
   rankConfigsForInstagram,
+  recordDestinationEvidence,
+  satisfiesTier,
 } from './profileQuality';
+import {
+  TARGET_KEYS,
+  TARGET_KEY_GOOGLE,
+  TARGET_KEY_META,
+  TARGET_KEY_YOUTUBE,
+  TARGET_KEY_DOWNLOAD,
+  REQUIRED_POLICY_DEFAULT,
+  REQUIRED_POLICY_INSTAGRAM,
+  REQUIRED_POLICY_STRICT,
+  VERIFICATION_TIERS,
+} from '../constants/testTargets';
+import {
+  isCountryCompatible,
+  checkCountryCompatibility,
+  normalizeCountryCode,
+  determineExitCountryProvenance,
+} from './country';
 
 function config(overrides: Partial<V2RayConfig>): V2RayConfig {
   return {
@@ -16,7 +39,7 @@ function config(overrides: Partial<V2RayConfig>): V2RayConfig {
     type: 'vless',
     address: 'example.test',
     port: '443',
-    rawUri: 'vless://test@example.test:443',
+    rawUri: 'vless:\x2f\x2ftest@example.test:443',
     ...overrides,
   };
 }
@@ -64,7 +87,7 @@ test('quality does not award an unmeasured protocol or clean-IP bonus', () => {
     ...base,
     id: 'decorated',
     cleanIp: '198.51.100.7',
-    rawUri: 'vless://test@example.test:443?security=reality',
+    rawUri: 'vless:\x2f\x2ftest@example.test:443?security=reality',
   });
   assert.equal(computeConfigQuality(base).score, computeConfigQuality(decorated).score);
 });
@@ -120,4 +143,266 @@ test('mobile screening is bounded and reports failures without deleting candidat
   assert.equal(candidates.length, 100);
   assert.ok(updates.find(candidate => candidate.id === '0')?.retryAfter);
   assert.equal(connectionCandidates(updates).some(candidate => candidate.id === '0'), false);
+});
+
+test('destination evidence records are serializable and preserve all required properties', () => {
+  const stamp = new Date().toISOString();
+  const evidence = createDestinationEvidence(TARGET_KEY_GOOGLE, {
+    status: 'pass',
+    httpStatus: 204,
+    latency: 145,
+    bytes: 0,
+    verificationTier: VERIFICATION_TIERS.L7_HTTP,
+    checkedAt: stamp,
+  });
+
+  assert.equal(evidence.destinationKey, TARGET_KEY_GOOGLE);
+  assert.equal(evidence.destination, TARGET_KEY_GOOGLE);
+  assert.equal(evidence.status, 'pass');
+  assert.equal(evidence.httpStatus, 204);
+  assert.equal(evidence.latency, 145);
+  assert.equal(evidence.bytes, 0);
+  assert.equal(evidence.error, undefined);
+  assert.equal(evidence.checkedAt, stamp);
+  assert.equal(evidence.verificationTier, 'l7_http');
+
+  // Verify full JSON serializability
+  const serialized = JSON.stringify(evidence);
+  const parsed = JSON.parse(serialized);
+  assert.deepEqual(parsed, evidence);
+
+  // Verify attachment to config and retrieval
+  const baseConfig = config({ id: 'cfg-evidence' });
+  const updated = recordDestinationEvidence(baseConfig, evidence);
+  const retrieved = getDestinationEvidence(updated, TARGET_KEY_GOOGLE);
+  assert.ok(retrieved);
+  assert.equal(retrieved.destinationKey, TARGET_KEY_GOOGLE);
+  assert.equal(retrieved.latency, 145);
+});
+
+test('verification tier hierarchy correctly evaluates compliance', () => {
+  assert.equal(satisfiesTier('l7_http', 'l4_tcp'), true);
+  assert.equal(satisfiesTier('l7_payload', 'l7_http'), true);
+  assert.equal(satisfiesTier('l4_tcp', 'l7_http'), false);
+  assert.equal(satisfiesTier('basic', 'standard'), false);
+  assert.equal(satisfiesTier('standard', 'basic'), true);
+  assert.equal(satisfiesTier('strict', 'standard'), true);
+  assert.equal(satisfiesTier('standard', 'strict'), false);
+  assert.equal(satisfiesTier('full', 'strict'), true);
+  assert.equal(satisfiesTier(undefined, 'l7_http'), false);
+  assert.equal(satisfiesTier('l7_http', undefined), true);
+});
+
+test('fail-closed country compatibility strictly rejects unknown and inferred provenance', () => {
+  // 1. Provenance 'unknown' must be rejected
+  const unknownProv = config({
+    id: 'unknown-country',
+    exitCountry: 'DE',
+    exitCountryProvenance: 'unknown',
+  });
+  assert.equal(isCountryCompatible(unknownProv, 'DE'), false);
+  const unknownCheck = checkCountryCompatibility(unknownProv, 'DE');
+  assert.equal(unknownCheck.compatible, false);
+  assert.ok(unknownCheck.reason?.includes('fail-closed'));
+
+  // 2. Provenance 'inferred' must be rejected (fail-closed rule)
+  const inferredProv = config({
+    id: 'inferred-country',
+    exitCountry: 'DE',
+    exitCountryProvenance: 'inferred',
+    name: '🇩🇪 Germany Fast',
+  });
+  assert.equal(isCountryCompatible(inferredProv, 'DE'), false);
+  const inferredCheck = checkCountryCompatibility(inferredProv, 'DE');
+  assert.equal(inferredCheck.compatible, false);
+  assert.ok(inferredCheck.reason?.includes('fail-closed'));
+
+  // 3. Unspecified provenance must be treated as unknown and rejected
+  const noProv = config({
+    id: 'no-prov',
+    exitCountry: 'DE',
+  });
+  assert.equal(isCountryCompatible(noProv, 'DE'), false);
+
+  // 4. Inferred only from config name must be rejected
+  const nameOnly = config({
+    id: 'name-only',
+    name: '🇩🇪 Germany Reality Server',
+  });
+  assert.equal(isCountryCompatible(nameOnly, 'DE'), false);
+
+  // 5. Provenance 'measured' matching expected country must succeed
+  const measuredProv = config({
+    id: 'measured-country',
+    exitCountry: 'DE',
+    exitCountryProvenance: 'measured',
+  });
+  assert.equal(isCountryCompatible(measuredProv, 'DE'), true);
+  assert.equal(isCountryCompatible(measuredProv, 'de'), true);
+  assert.equal(isCountryCompatible(measuredProv, 'آلمان'), true);
+
+  // 6. Provenance 'measured' but country mismatch must fail
+  assert.equal(isCountryCompatible(measuredProv, 'US'), false);
+
+  // 7. No expected country required allows any config
+  assert.equal(isCountryCompatible(inferredProv), true);
+  assert.equal(isCountryCompatible(unknownProv), true);
+
+  // 8. Helper determineExitCountryProvenance
+  assert.equal(determineExitCountryProvenance({ measured: true }), 'measured');
+  assert.equal(determineExitCountryProvenance({ hasMeasuredExitIp: true }), 'measured');
+  assert.equal(determineExitCountryProvenance({ inferredFromName: true }), 'inferred');
+  assert.equal(determineExitCountryProvenance({}), 'unknown');
+  assert.equal(determineExitCountryProvenance({ provenanceOverride: 'measured' }), 'measured');
+});
+
+test('destination-aware eligibility enforces destinations, tiers, and limits', () => {
+  const stamp = new Date().toISOString();
+  const validGoogleEvidence = createDestinationEvidence(TARGET_KEY_GOOGLE, {
+    status: 'pass',
+    httpStatus: 204,
+    latency: 120,
+    verificationTier: VERIFICATION_TIERS.L7_HTTP,
+    checkedAt: stamp,
+  });
+  const validMetaEvidence = createDestinationEvidence(TARGET_KEY_META, {
+    status: 'pass',
+    httpStatus: 204,
+    latency: 180,
+    verificationTier: VERIFICATION_TIERS.L7_HTTP,
+    checkedAt: stamp,
+  });
+  const failedMetaEvidence = createDestinationEvidence(TARGET_KEY_META, {
+    status: 'fail',
+    error: 'timeout',
+    checkedAt: stamp,
+  });
+
+  const verifiedConfig = config({
+    id: 'dual-verified',
+    realDelay: 150,
+    ping: 150,
+    lastSuccessAt: stamp,
+    destinationEvidence: {
+      [TARGET_KEY_GOOGLE]: validGoogleEvidence,
+      [TARGET_KEY_META]: validMetaEvidence,
+    },
+  });
+
+  // Base eligibility passes
+  assert.equal(isConfigEligible(verifiedConfig), true);
+
+  // Required destination present and passing
+  assert.equal(
+    isConfigEligible(verifiedConfig, { requiredDestinations: [TARGET_KEY_GOOGLE, TARGET_KEY_META] }),
+    true
+  );
+
+  // Missing destination fails eligibility
+  assert.equal(
+    isConfigEligible(verifiedConfig, { requiredDestinations: [TARGET_KEY_DOWNLOAD] }),
+    false
+  );
+
+  // Max latency exceeded fails eligibility
+  assert.equal(
+    isConfigEligible(verifiedConfig, { requiredDestinations: [TARGET_KEY_META], maxLatencyMs: 100 }),
+    false
+  );
+
+  // Failed destination status fails eligibility
+  const withFailedMeta = recordDestinationEvidence(verifiedConfig, failedMetaEvidence);
+  assert.equal(
+    isConfigEligible(withFailedMeta, { requiredDestinations: [TARGET_KEY_META] }),
+    false
+  );
+});
+
+test('pickBestConfig with destination and fail-closed country policy', () => {
+  const stamp = new Date().toISOString();
+
+  // Config A: German, measured exit country, passing meta evidence
+  const germanMeasured = config({
+    id: 'de-measured',
+    realDelay: 160,
+    ping: 160,
+    exitCountry: 'DE',
+    exitCountryProvenance: 'measured',
+    lastSuccessAt: stamp,
+    destinationEvidence: {
+      [TARGET_KEY_META]: createDestinationEvidence(TARGET_KEY_META, {
+        status: 'pass',
+        latency: 160,
+        verificationTier: 'l7_http',
+        checkedAt: stamp,
+      }),
+      [TARGET_KEY_GOOGLE]: createDestinationEvidence(TARGET_KEY_GOOGLE, {
+        status: 'pass',
+        latency: 140,
+        verificationTier: 'l7_http',
+        checkedAt: stamp,
+      }),
+    },
+  });
+
+  // Config B: German, inferred exit country (lower latency, but inferred)
+  const germanInferred = config({
+    id: 'de-inferred',
+    realDelay: 90,
+    ping: 90,
+    exitCountry: 'DE',
+    exitCountryProvenance: 'inferred',
+    name: '🇩🇪 Germany Super Fast',
+    lastSuccessAt: stamp,
+    destinationEvidence: {
+      [TARGET_KEY_META]: createDestinationEvidence(TARGET_KEY_META, {
+        status: 'pass',
+        latency: 90,
+        verificationTier: 'l7_http',
+        checkedAt: stamp,
+      }),
+    },
+  });
+
+  // Config C: US, measured exit country, passing meta evidence
+  const usMeasured = config({
+    id: 'us-measured',
+    realDelay: 120,
+    ping: 120,
+    exitCountry: 'US',
+    exitCountryProvenance: 'measured',
+    lastSuccessAt: stamp,
+    destinationEvidence: {
+      [TARGET_KEY_META]: createDestinationEvidence(TARGET_KEY_META, {
+        status: 'pass',
+        latency: 120,
+        verificationTier: 'l7_http',
+        checkedAt: stamp,
+      }),
+    },
+  });
+
+  // When policy requires 'DE' country:
+  // Fail-closed MUST reject de-inferred (despite lower latency) and pick de-measured!
+  const pickedGerman = pickBestConfig([germanInferred, germanMeasured, usMeasured], {
+    requiredCountry: 'DE',
+    requiredDestinations: [TARGET_KEY_META],
+  });
+  assert.equal(pickedGerman?.id, 'de-measured');
+
+  // If only inferred German config is available, it returns null (fail-closed)
+  const pickedOnlyInferred = pickBestConfig([germanInferred], {
+    requiredCountry: 'DE',
+  });
+  assert.equal(pickedOnlyInferred, null);
+
+  // When policy requires Instagram destination policy preset:
+  const pickedInstagram = pickBestConfig([germanMeasured, usMeasured], {
+    destinationPolicy: REQUIRED_POLICY_INSTAGRAM,
+  });
+  assert.ok(pickedInstagram);
+
+  // Legacy callers without options still work exactly as before
+  const legacyPick = pickBestConfig([germanInferred, germanMeasured]);
+  assert.ok(legacyPick);
 });

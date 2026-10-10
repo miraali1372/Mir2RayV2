@@ -1,3 +1,7 @@
+import { ExitCountryProvenance } from '../types';
+
+export type { ExitCountryProvenance };
+
 export interface CountryInfo {
   code: string;
   name: string;
@@ -112,10 +116,11 @@ export function extractCountryFromName(name?: string): CountryInfo | null {
   return null;
 }
 
-export function getDisplayCountry(exitCountry?: string, configName?: string): string {
+export function getDisplayCountry(exitCountry?: string, configName?: string, provenance?: ExitCountryProvenance): string {
   const fromCode = resolveCountryFromCode(exitCountry);
   if (fromCode) {
-    return `${fromCode.flag} ${fromCode.name}`;
+    const provIndicator = provenance === 'inferred' ? ' (~)' : '';
+    return `${fromCode.flag} ${fromCode.name}${provIndicator}`;
   }
 
   const fromName = extractCountryFromName(configName);
@@ -124,4 +129,137 @@ export function getDisplayCountry(exitCountry?: string, configName?: string): st
   }
 
   return '';
+}
+
+export function normalizeCountryCode(country?: string): string | null {
+  if (!country) return null;
+  const trimmed = country.trim();
+  const upper = trimmed.toUpperCase();
+  if (COUNTRY_MAP[upper] || /^[A-Z]{2}$/.test(upper)) {
+    return upper;
+  }
+
+  const fromCode = resolveCountryFromCode(trimmed);
+  if (fromCode) return fromCode.code;
+
+  const fromName = extractCountryFromName(trimmed);
+  if (fromName) return fromName.code;
+
+  for (const [code, info] of Object.entries(COUNTRY_MAP)) {
+    if (info.name === trimmed || info.flag === trimmed) {
+      return code;
+    }
+  }
+
+  return null;
+}
+
+export interface CountryCompatibilityResult {
+  compatible: boolean;
+  reason?: string;
+  actualCountry?: string;
+  expectedCountry?: string;
+  provenance: ExitCountryProvenance;
+}
+
+/**
+ * Validates country compatibility with fail-closed semantics.
+ * If expectedCountry is specified, only configs with 'measured' provenance matching
+ * the expected country are accepted. 'inferred', 'unknown', or missing provenance is rejected.
+ */
+export function checkCountryCompatibility(
+  configOrCountry:
+    | { exitCountry?: string; exitCountryProvenance?: ExitCountryProvenance; name?: string }
+    | string
+    | undefined,
+  expectedCountry?: string,
+  provenance?: ExitCountryProvenance
+): CountryCompatibilityResult {
+  const country = typeof configOrCountry === 'string'
+    ? configOrCountry
+    : configOrCountry?.exitCountry;
+  const actualProvenance: ExitCountryProvenance = (typeof configOrCountry === 'object' && configOrCountry !== null
+    ? configOrCountry.exitCountryProvenance
+    : provenance) ?? 'unknown';
+
+  if (!expectedCountry) {
+    return {
+      compatible: true,
+      actualCountry: country ? (normalizeCountryCode(country) ?? country) : undefined,
+      provenance: actualProvenance,
+    };
+  }
+
+  const expectedCode = normalizeCountryCode(expectedCountry);
+  if (!expectedCode) {
+    return {
+      compatible: false,
+      reason: `Invalid expected country: ${expectedCountry}`,
+      actualCountry: country,
+      expectedCountry,
+      provenance: actualProvenance,
+    };
+  }
+
+  // Fail-closed rule: unknown and inferred are strictly rejected
+  if (actualProvenance !== 'measured') {
+    return {
+      compatible: false,
+      reason: `Exit country provenance '${actualProvenance}' is not 'measured' (fail-closed policy)`,
+      actualCountry: country,
+      expectedCountry: expectedCode,
+      provenance: actualProvenance,
+    };
+  }
+
+  if (!country) {
+    return {
+      compatible: false,
+      reason: 'Exit country is not recorded',
+      expectedCountry: expectedCode,
+      provenance: actualProvenance,
+    };
+  }
+
+  const actualCode = normalizeCountryCode(country);
+  if (actualCode !== expectedCode) {
+    return {
+      compatible: false,
+      reason: `Measured exit country '${actualCode}' does not match expected '${expectedCode}'`,
+      actualCountry: actualCode ?? country,
+      expectedCountry: expectedCode,
+      provenance: actualProvenance,
+    };
+  }
+
+  return {
+    compatible: true,
+    actualCountry: actualCode,
+    expectedCountry: expectedCode,
+    provenance: actualProvenance,
+  };
+}
+
+export function isCountryCompatible(
+  configOrCountry:
+    | { exitCountry?: string; exitCountryProvenance?: ExitCountryProvenance; name?: string }
+    | string
+    | undefined,
+  expectedCountry?: string,
+  provenance?: ExitCountryProvenance
+): boolean {
+  return checkCountryCompatibility(configOrCountry, expectedCountry, provenance).compatible;
+}
+
+export function determineExitCountryProvenance(options: {
+  exitCountry?: string;
+  hasMeasuredExitIp?: boolean;
+  measured?: boolean;
+  inferredFromName?: boolean;
+  provenanceOverride?: ExitCountryProvenance;
+}): ExitCountryProvenance {
+  if (options.provenanceOverride) return options.provenanceOverride;
+  if (options.measured || options.hasMeasuredExitIp) return 'measured';
+  if (options.inferredFromName) return 'inferred';
+  return 'unknown';
 }

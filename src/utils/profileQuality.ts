@@ -1,4 +1,11 @@
-import { V2RayConfig } from '../types';
+import {
+  DestinationEvidence,
+  DestinationPolicy,
+  ExitCountryProvenance,
+  V2RayConfig,
+  VerificationTier,
+} from '../types';
+import { isCountryCompatible } from './country';
 
 export interface ConfigQuality {
   score: number;
@@ -20,6 +27,144 @@ export function isMeasurementFresh(stamp: string | undefined, maxAgeMs = LATENCY
   return Number.isFinite(age) && age >= 0 && age <= maxAgeMs;
 }
 
+const TIER_LEVELS: Record<string, number> = {
+  l4_tcp: 1,
+  tcp: 1,
+  basic: 1,
+  l7_http: 2,
+  http: 2,
+  standard: 2,
+  l7_payload: 3,
+  payload: 3,
+  strict: 3,
+  bandwidth: 3,
+  full: 4,
+};
+
+export function satisfiesTier(actualTier?: string, requiredTier?: string): boolean {
+  if (!requiredTier) return true;
+  if (!actualTier) return false;
+  const actualLevel = TIER_LEVELS[actualTier.toLowerCase()] ?? 0;
+  const requiredLevel = TIER_LEVELS[requiredTier.toLowerCase()] ?? 0;
+  return actualLevel >= requiredLevel;
+}
+
+export function createDestinationEvidence(
+  destinationKey: string,
+  options: Partial<DestinationEvidence> = {}
+): DestinationEvidence {
+  const result: DestinationEvidence = {
+    destinationKey,
+    destination: options.destination ?? destinationKey,
+    status: options.status ?? 'pass',
+    checkedAt: options.checkedAt ?? new Date().toISOString(),
+    verificationTier: options.verificationTier ?? 'l7_http',
+  };
+  if (options.httpStatus !== undefined) result.httpStatus = options.httpStatus;
+  if (options.statusCode !== undefined || options.httpStatus !== undefined) {
+    result.statusCode = options.statusCode ?? options.httpStatus;
+  }
+  if (options.latency !== undefined) result.latency = options.latency;
+  if (options.bytes !== undefined) result.bytes = options.bytes;
+  if (options.error !== undefined) result.error = options.error;
+  return result;
+}
+
+export function getDestinationEvidence(
+  config: V2RayConfig,
+  destinationKey: string
+): DestinationEvidence | undefined {
+  const store = config.destinationEvidence ?? config.evidence;
+  if (!store) return undefined;
+  if (Array.isArray(store)) {
+    return store.find(e => e.destinationKey === destinationKey || e.destination === destinationKey);
+  }
+  return store[destinationKey];
+}
+
+export function recordDestinationEvidence(
+  config: V2RayConfig,
+  evidence: DestinationEvidence
+): V2RayConfig {
+  const existingMap: Record<string, DestinationEvidence> = Array.isArray(config.destinationEvidence)
+    ? Object.fromEntries(config.destinationEvidence.map(e => [e.destinationKey || e.destination || '', e]))
+    : { ...(config.destinationEvidence ?? config.evidence ?? {}) };
+
+  const key = evidence.destinationKey || evidence.destination;
+  if (key) {
+    existingMap[key] = evidence;
+  }
+
+  return {
+    ...config,
+    destinationEvidence: existingMap,
+    evidence: existingMap,
+  };
+}
+
+export function isDestinationEvidencePassing(
+  evidence: DestinationEvidence | undefined,
+  options: {
+    maxLatencyMs?: number;
+    minBytes?: number;
+    requiredTier?: VerificationTier | string;
+    maxAgeMs?: number;
+    now?: number;
+  } = {}
+): boolean {
+  if (!evidence) return false;
+  const status = evidence.status;
+  if (status !== 'pass' && status !== 'success') return false;
+  if (evidence.error) return false;
+
+  const now = options.now ?? Date.now();
+  const maxAge = options.maxAgeMs ?? LATENCY_MAX_AGE_MS;
+  if (!isMeasurementFresh(evidence.checkedAt, maxAge, now)) return false;
+
+  if (typeof evidence.httpStatus === 'number') {
+    if (evidence.httpStatus < 200 || evidence.httpStatus >= 300) return false;
+  }
+
+  if (typeof options.maxLatencyMs === 'number') {
+    if (typeof evidence.latency !== 'number' || evidence.latency > options.maxLatencyMs) {
+      return false;
+    }
+  }
+
+  if (typeof options.minBytes === 'number') {
+    const bytes = typeof evidence.bytes === 'number' ? evidence.bytes : 0;
+    if (bytes < options.minBytes) return false;
+  }
+
+  if (options.requiredTier && !satisfiesTier(evidence.verificationTier, options.requiredTier)) {
+    return false;
+  }
+
+  return true;
+}
+
+export function getBestDestinationLatency(config: V2RayConfig): number | undefined {
+  const store = config.destinationEvidence ?? config.evidence;
+  if (!store) return undefined;
+  const list = Array.isArray(store) ? store : Object.values(store);
+  let best: number | undefined;
+  for (const e of list) {
+    if (isDestinationEvidencePassing(e) && typeof e.latency === 'number' && e.latency > 0) {
+      if (best === undefined || e.latency < best) {
+        best = e.latency;
+      }
+    }
+  }
+  return best;
+}
+
+export function hasPassingL7DestinationEvidence(config: V2RayConfig): boolean {
+  const store = config.destinationEvidence ?? config.evidence;
+  if (!store) return false;
+  const list = Array.isArray(store) ? store : Object.values(store);
+  return list.some(e => isDestinationEvidencePassing(e, { requiredTier: 'l7_http' }));
+}
+
 export function configMeasurementKey(config: V2RayConfig, context: string): string {
   return JSON.stringify([config.rawUri, config.cleanIp ?? '', config.fragment ?? null, context]);
 }
@@ -27,7 +172,8 @@ export function configMeasurementKey(config: V2RayConfig, context: string): stri
 export function hasFreshVerification(config: V2RayConfig): boolean {
   return isMeasurementFresh(config.verifiedAt)
     || (typeof config.realDelay === 'number' && config.realDelay > 0
-      && isMeasurementFresh(config.latencyTestedAt ?? config.lastSuccessAt));
+      && isMeasurementFresh(config.latencyTestedAt ?? config.lastSuccessAt))
+    || hasPassingL7DestinationEvidence(config);
 }
 
 export function recordConfigFailure(config: V2RayConfig, now = Date.now()): V2RayConfig {
@@ -66,23 +212,29 @@ export function computeConfigQuality(config: V2RayConfig): ConfigQuality {
     };
   }
 
+  const destinationLatency = getBestDestinationLatency(config);
   const effectiveLatency = typeof config.realDelay === 'number'
     ? config.realDelay
     : typeof config.tcpPing === 'number'
       ? config.tcpPing
       : typeof config.ping === 'number'
         ? config.ping
-        : undefined;
+        : destinationLatency;
 
   const hasLatency = typeof effectiveLatency === 'number' && Number.isFinite(effectiveLatency) && effectiveLatency >= 0;
-  const isRealVerified = typeof config.realDelay === 'number' && config.realDelay > 0;
+  const isRealVerified = (typeof config.realDelay === 'number' && config.realDelay > 0)
+    || hasPassingL7DestinationEvidence(config);
   const bandwidthFresh = isMeasurementFresh(config.bandwidthTestedAt ?? config.lastSuccessAt, BANDWIDTH_MAX_AGE_MS);
   const hasDownload = bandwidthFresh && typeof config.downloadBps === 'number' && config.downloadBps > 0;
   const hasUpload = bandwidthFresh && typeof config.uploadBps === 'number' && config.uploadBps > 0;
+  const hasDestinationTested = Boolean(
+    config.destinationEvidence && Object.keys(config.destinationEvidence).length > 0
+  );
 
   const tested = hasLatency
     || hasDownload
     || hasUpload
+    || hasDestinationTested
     || config.ping === 'error'
     || config.realDelay === 'error'
     || config.tcpPing === 'error'
@@ -296,16 +448,167 @@ export function rankConfigsForInstagram(configs: V2RayConfig[]): V2RayConfig[] {
   return rankConfigs(configs);
 }
 
+export interface PickBestConfigOptions {
+  excludeId?: string;
+  minScore?: number;
+  requireTested?: boolean;
+  requiredDestinations?: string[];
+  destinationPolicy?: DestinationPolicy;
+  requiredCountry?: string;
+  targetCountry?: string;
+  requireMeasuredCountry?: boolean;
+  requiredTier?: VerificationTier | string;
+  maxLatencyMs?: number;
+  minBytes?: number;
+  now?: number;
+}
+
+export type DestinationEligibilityOptions = PickBestConfigOptions;
+
+export function isConfigEligible(
+  config: V2RayConfig,
+  options: DestinationEligibilityOptions = {}
+): boolean {
+  const now = options.now ?? Date.now();
+  const { excludeId, minScore = 1, requireTested = true } = options;
+
+  if (excludeId && config.id === excludeId) return false;
+  if (!isConnectableConfig(config)) return false;
+  if ((config.retryAfter ?? 0) > now) return false;
+
+  const quality = computeConfigQuality(config);
+  if (requireTested) {
+    if (!quality.tested || !quality.usable) return false;
+  }
+  if (quality.score < minScore) return false;
+  if (config.ping === 'error' || config.realDelay === 'error') return false;
+
+  // Country policy check (FAIL-CLOSED)
+  const policy = options.destinationPolicy;
+  const targetCountry = options.requiredCountry
+    ?? options.targetCountry
+    ?? policy?.requiredCountry
+    ?? policy?.targetCountry;
+
+  if (targetCountry) {
+    if (!isCountryCompatible(config, targetCountry)) {
+      return false;
+    }
+  }
+
+  const requireMeasured = options.requireMeasuredCountry
+    ?? policy?.requireMeasuredCountry
+    ?? (policy?.failClosedCountry && targetCountry != null);
+
+  if (requireMeasured) {
+    if (config.exitCountryProvenance !== 'measured') {
+      return false;
+    }
+  }
+
+  // Destination policy check
+  const requiredDestinations = options.requiredDestinations ?? policy?.requiredDestinations;
+  if (requiredDestinations && requiredDestinations.length > 0) {
+    const requiredTier = options.requiredTier ?? policy?.requiredTier;
+    const maxLatencyMs = options.maxLatencyMs ?? policy?.maxLatencyMs;
+    const minBytes = options.minBytes ?? policy?.minBytes;
+    const requireAll = policy?.requireAll ?? true;
+    const minPassing = policy?.minPassingDestinations ?? (requireAll ? requiredDestinations.length : 1);
+
+    let passingCount = 0;
+    for (const destKey of requiredDestinations) {
+      const evidence = getDestinationEvidence(config, destKey);
+      if (isDestinationEvidencePassing(evidence, {
+        maxLatencyMs,
+        minBytes,
+        requiredTier,
+        now,
+      })) {
+        passingCount += 1;
+      }
+    }
+
+    if (requireAll && passingCount < requiredDestinations.length) {
+      return false;
+    }
+    if (passingCount < minPassing) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export function satisfiesDestinationPolicy(
+  config: V2RayConfig,
+  policy: DestinationPolicy,
+  now = Date.now()
+): boolean {
+  return isConfigEligible(config, { destinationPolicy: policy, now });
+}
+
+function countPassingDestinations(
+  config: V2RayConfig,
+  destinations: string[],
+  options: PickBestConfigOptions
+): number {
+  let count = 0;
+  for (const d of destinations) {
+    const ev = getDestinationEvidence(config, d);
+    if (isDestinationEvidencePassing(ev, {
+      maxLatencyMs: options.maxLatencyMs ?? options.destinationPolicy?.maxLatencyMs,
+      minBytes: options.minBytes ?? options.destinationPolicy?.minBytes,
+      requiredTier: options.requiredTier ?? options.destinationPolicy?.requiredTier,
+      now: options.now,
+    })) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function getAverageDestinationLatency(config: V2RayConfig, destinations: string[]): number {
+  let sum = 0;
+  let count = 0;
+  for (const d of destinations) {
+    const ev = getDestinationEvidence(config, d);
+    if (ev && typeof ev.latency === 'number' && ev.latency > 0) {
+      sum += ev.latency;
+      count++;
+    }
+  }
+  return count > 0 ? sum / count : Number.POSITIVE_INFINITY;
+}
+
+export function rankConfigsByDestinationEvidence(
+  configs: V2RayConfig[],
+  destinations: string[] = []
+): V2RayConfig[] {
+  return [...configs].sort((a, b) => {
+    if (destinations.length > 0) {
+      const aPass = countPassingDestinations(a, destinations, {});
+      const bPass = countPassingDestinations(b, destinations, {});
+      if (bPass !== aPass) return bPass - aPass;
+
+      const aLat = getAverageDestinationLatency(a, destinations);
+      const bLat = getAverageDestinationLatency(b, destinations);
+      if (aLat !== bLat) return aLat - bLat;
+    }
+    const qa = computeConfigQuality(a);
+    const qb = computeConfigQuality(b);
+    if (qb.score !== qa.score) return qb.score - qa.score;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 export function pickBestConfig(
   configs: V2RayConfig[],
-  options: { excludeId?: string; minScore?: number; requireTested?: boolean } = {}
+  options: PickBestConfigOptions = {}
 ): V2RayConfig | null {
-  const { excludeId, minScore = 1, requireTested = true } = options;
-  return rankConfigsForInstagram(configs).find(config => {
-    if (excludeId && config.id === excludeId) return false;
-    const quality = computeConfigQuality(config);
-    if (!quality.usable || quality.score < minScore) return false;
-    if (requireTested && !quality.tested) return false;
-    return true;
-  }) ?? null;
+  const reqDests = options.requiredDestinations ?? options.destinationPolicy?.requiredDestinations;
+  const candidatePool = reqDests && reqDests.length > 0
+    ? rankConfigsByDestinationEvidence(configs, reqDests)
+    : rankConfigsForInstagram(configs);
+
+  return candidatePool.find(config => isConfigEligible(config, options)) ?? null;
 }

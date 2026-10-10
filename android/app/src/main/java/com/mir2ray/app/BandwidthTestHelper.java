@@ -23,6 +23,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -98,6 +99,78 @@ final class BandwidthTestHelper {
         if (session != null) session.track(socket);
     }
 
+    public static final class TargetEvidence {
+        public final String target;
+        public final String destination;
+        public final boolean ok;
+        public final int status;
+        public final int statusCode;
+        public final long latencyMs;
+        public final long bytes;
+        public final String error;
+        public final long checkedAt;
+        public final String tier;
+        public final boolean browserVerified;
+
+        public TargetEvidence(
+                String target,
+                String destination,
+                boolean ok,
+                int statusCode,
+                long latencyMs,
+                long bytes,
+                String error,
+                long checkedAt,
+                String tier,
+                boolean browserVerified
+        ) {
+            this.target = target != null ? target : "";
+            this.destination = destination != null ? destination : "unknown";
+            this.ok = ok;
+            this.status = statusCode;
+            this.statusCode = statusCode;
+            this.latencyMs = latencyMs;
+            this.bytes = bytes;
+            this.error = error;
+            this.checkedAt = checkedAt;
+            this.tier = tier != null ? tier : "standard";
+            this.browserVerified = browserVerified;
+        }
+
+        public JSONObject toJson() {
+            JSONObject obj = new JSONObject();
+            try {
+                obj.put("target", target);
+                obj.put("destination", destination);
+                obj.put("ok", ok);
+                obj.put("status", status);
+                obj.put("statusCode", statusCode);
+                obj.put("latencyMs", latencyMs);
+                obj.put("bytes", bytes);
+                if (error != null) {
+                    obj.put("error", error);
+                } else {
+                    obj.put("error", JSONObject.NULL);
+                }
+                obj.put("checkedAt", checkedAt);
+                obj.put("tier", tier);
+                obj.put("browserVerified", browserVerified);
+            } catch (Exception ignored) {
+            }
+            return obj;
+        }
+    }
+
+    private static final class ProbeResult {
+        final BandwidthSample sample;
+        final TargetEvidence evidence;
+
+        ProbeResult(BandwidthSample sample, TargetEvidence evidence) {
+            this.sample = sample;
+            this.evidence = evidence;
+        }
+    }
+
     static final class BandwidthResult {
         final long downloadBps;
         final long uploadBps;
@@ -111,6 +184,8 @@ final class BandwidthTestHelper {
         long jitterMs = -1;
         String exitIp = null;
         String exitCountry = null;
+        String countryProvenance = null;
+        List<TargetEvidence> targetEvidence = new ArrayList<>();
 
         BandwidthResult(long downloadBps, long uploadBps, long downloadBytes, long downloadMs, long uploadMs, boolean ok, String message) {
             this(downloadBps, uploadBps, downloadBytes, downloadMs, downloadMs, uploadMs, ok, message);
@@ -213,6 +288,7 @@ final class BandwidthTestHelper {
                         : -1;
                 String exitIp = null;
                 String exitCountry = null;
+                String countryProvenance = null;
 
                 if (!delayOnly) {
                     try {
@@ -224,7 +300,10 @@ final class BandwidthTestHelper {
                         );
                         if (exitIpRes.ok && PublicIpHelper.isUsablePublicIp(exitIpRes.ip)) {
                             exitIp = exitIpRes.ip;
-                            exitCountry = exitIpRes.country;
+                            if (exitIpRes.country != null && !exitIpRes.country.trim().isEmpty()) {
+                                exitCountry = exitIpRes.country.trim();
+                            }
+                            countryProvenance = "measured";
                         }
                     } catch (Throwable ignored) {
                     }
@@ -239,7 +318,7 @@ final class BandwidthTestHelper {
 
                     int probeCount = delayUrls.size();
                     ExecutorService delayPool = Executors.newFixedThreadPool(Math.min(probeCount, 3));
-                    List<Future<BandwidthSample>> delayFutures = new ArrayList<>(probeCount);
+                    List<Future<ProbeResult>> delayFutures = new ArrayList<>(probeCount);
                     int remaining = remainingTimeoutMs(delayDeadlineNanos);
                     int probeTimeout = Math.min(remaining, Math.max(1500, timeoutMs));
 
@@ -247,10 +326,23 @@ final class BandwidthTestHelper {
                         final String probeUrl = targetUrl;
                         delayFutures.add(delayPool.submit(() -> {
                             try {
-                                return measureHttpDelay(proxy, probeUrl, probeTimeout, DELAY_SAMPLE_COUNT);
+                                return probeTarget(proxy, probeUrl, probeTimeout, DELAY_SAMPLE_COUNT);
                             } catch (Exception e) {
-                                Log.w(TAG, "Delay probe target failed: " + probeUrl + " (" + e.getMessage() + ")");
-                                return null;
+                                Log.w(TAG, "Delay probe target failed: " + sanitizeUrl(probeUrl) + " (" + sanitizeError(e.getMessage()) + ")");
+                                String host = extractHost(probeUrl);
+                                TargetEvidence ev = new TargetEvidence(
+                                        sanitizeUrl(probeUrl),
+                                        host,
+                                        false,
+                                        -1,
+                                        -1,
+                                        0,
+                                        sanitizeError(e.getMessage()),
+                                        System.currentTimeMillis(),
+                                        determineTier(probeUrl),
+                                        false
+                                );
+                                return new ProbeResult(null, ev);
                             }
                         }));
                     }
@@ -258,34 +350,87 @@ final class BandwidthTestHelper {
 
                     List<Long> targetDelays = new ArrayList<>(probeCount);
                     List<String> successfulUrls = new ArrayList<>(probeCount);
+                    List<TargetEvidence> evidences = new ArrayList<>(probeCount);
                     long bytesRead = 0;
                     long coldDelayMs = 0;
                     long jitterMs = 0;
+                    boolean allSucceeded = true;
 
                     for (int i = 0; i < probeCount; i++) {
+                        String probeUrl = delayUrls.get(i);
                         try {
-                            BandwidthSample delay = delayFutures.get(i).get(probeTimeout + 500L, TimeUnit.MILLISECONDS);
-                            if (delay != null && delay.ms >= 0) {
-                                targetDelays.add(delay.ms);
-                                successfulUrls.add(delayUrls.get(i));
-                                bytesRead += delay.bytes;
-                                coldDelayMs = Math.max(coldDelayMs, delay.coldMs);
-                                jitterMs = Math.max(jitterMs, delay.jitterMs);
+                            ProbeResult pr = delayFutures.get(i).get(probeTimeout + 500L, TimeUnit.MILLISECONDS);
+                            if (pr != null && pr.evidence != null) {
+                                evidences.add(pr.evidence);
+                                if (pr.evidence.ok && pr.sample != null && pr.sample.ms >= 0) {
+                                    targetDelays.add(pr.sample.ms);
+                                    successfulUrls.add(probeUrl);
+                                    bytesRead += pr.sample.bytes;
+                                    coldDelayMs = Math.max(coldDelayMs, pr.sample.coldMs);
+                                    jitterMs = Math.max(jitterMs, pr.sample.jitterMs);
+                                } else {
+                                    allSucceeded = false;
+                                }
+                            } else {
+                                allSucceeded = false;
+                                evidences.add(new TargetEvidence(
+                                        sanitizeUrl(probeUrl),
+                                        extractHost(probeUrl),
+                                        false,
+                                        -1,
+                                        -1,
+                                        0,
+                                        "Delay probe target returned no result",
+                                        System.currentTimeMillis(),
+                                        determineTier(probeUrl),
+                                        false
+                                ));
                             }
                         } catch (Exception e) {
-                            Log.w(TAG, "Delay future failed for " + delayUrls.get(i) + ": " + e.getMessage());
+                            allSucceeded = false;
+                            Log.w(TAG, "Delay future failed for " + sanitizeUrl(probeUrl) + ": " + sanitizeError(e.getMessage()));
+                            evidences.add(new TargetEvidence(
+                                    sanitizeUrl(probeUrl),
+                                    extractHost(probeUrl),
+                                    false,
+                                    -1,
+                                    -1,
+                                    0,
+                                    sanitizeError(e.getMessage()),
+                                    System.currentTimeMillis(),
+                                    determineTier(probeUrl),
+                                    false
+                            ));
                         }
                     }
 
-                    if (targetDelays.isEmpty()) {
-                        throw new IOException("All delay probe targets failed");
+                    // Strict aggregate success policy:
+                    boolean aggregateOk;
+                    JSONArray requiredJson = payload.optJSONArray("requiredTargets");
+                    if (requiredJson != null && requiredJson.length() > 0) {
+                        Set<String> requiredSet = new HashSet<>();
+                        for (int k = 0; k < requiredJson.length(); k++) {
+                            String req = requiredJson.optString(k, "").trim();
+                            if (!req.isEmpty()) requiredSet.add(req);
+                        }
+                        boolean allRequiredOk = !requiredSet.isEmpty();
+                        for (String req : requiredSet) {
+                            boolean found = false;
+                            for (String succ : successfulUrls) {
+                                if (succ.equalsIgnoreCase(req) || succ.contains(req)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                allRequiredOk = false;
+                                break;
+                            }
+                        }
+                        aggregateOk = allRequiredOk && !targetDelays.isEmpty();
+                    } else {
+                        aggregateOk = allSucceeded && !targetDelays.isEmpty() && targetDelays.size() == probeCount;
                     }
-                    long worstDelayMs = selectWorstDelayMs(targetDelays);
-                    long preferredDelayMs = selectPreferredDelayMs(
-                            successfulUrls,
-                            targetDelays,
-                            payload.optString("preferredDelayUrl", "")
-                    );
 
                     int remainingForIp = remainingTimeoutMs(delayDeadlineNanos);
                     if (remainingForIp > 300) {
@@ -296,26 +441,67 @@ final class BandwidthTestHelper {
                             );
                             if (exitIpRes.ok && PublicIpHelper.isUsablePublicIp(exitIpRes.ip)) {
                                 exitIp = exitIpRes.ip;
-                                exitCountry = exitIpRes.country;
+                                if (exitIpRes.country != null && !exitIpRes.country.trim().isEmpty()) {
+                                    exitCountry = exitIpRes.country.trim();
+                                }
+                                countryProvenance = "measured";
                             }
                         } catch (Throwable ignored) {
                         }
+                    }
+
+                    boolean requireExitIp = payload.optBoolean("requireExitIp", false)
+                            || shareUri.contains("#no-exit");
+                    if (requireExitIp && (exitIp == null || !PublicIpHelper.isUsablePublicIp(exitIp))) {
+                        aggregateOk = false;
+                    }
+
+                    long preferredDelayMs = -1;
+                    long worstDelayMs = -1;
+                    if (!targetDelays.isEmpty()) {
+                        worstDelayMs = selectWorstDelayMs(targetDelays);
+                        preferredDelayMs = selectPreferredDelayMs(
+                                successfulUrls,
+                                targetDelays,
+                                payload.optString("preferredDelayUrl", "")
+                        );
+                    }
+
+                    String resultMessage;
+                    if (targetDelays.isEmpty()) {
+                        if (requireExitIp && (exitIp == null || !PublicIpHelper.isUsablePublicIp(exitIp))) {
+                            resultMessage = "Exit IP validation failed";
+                        } else {
+                            resultMessage = "All delay probe targets failed";
+                        }
+                    } else if (!aggregateOk) {
+                        if (requireExitIp && (exitIp == null || !PublicIpHelper.isUsablePublicIp(exitIp))) {
+                            resultMessage = "Exit IP validation failed";
+                        } else {
+                            resultMessage = "Not all delay targets succeeded (" + successfulUrls.size() + "/" + probeCount + ")";
+                        }
+                    } else {
+                        resultMessage = null;
                     }
 
                     BandwidthResult result = new BandwidthResult(
                             -1,
                             -1,
                             bytesRead,
-                            preferredDelayMs,
+                            aggregateOk ? preferredDelayMs : -1L,
                             worstDelayMs,
                             -1,
-                            true,
-                            null
+                            aggregateOk,
+                            resultMessage
                     );
                     result.coldDelayMs = coldDelayMs;
                     result.jitterMs = jitterMs;
                     result.exitIp = exitIp;
                     result.exitCountry = exitCountry;
+                    result.countryProvenance = countryProvenance;
+                    result.targetEvidence = Collections.unmodifiableList(
+                            evidences.subList(0, Math.min(evidences.size(), 10))
+                    );
                     return result;
                 }
 
@@ -326,6 +512,7 @@ final class BandwidthTestHelper {
                     BandwidthResult result = new BandwidthResult(download.bps, -1, download.bytes, download.ms, -1, ok, message);
                     result.exitIp = exitIp;
                     result.exitCountry = exitCountry;
+                    result.countryProvenance = countryProvenance;
                     return result;
                 }
 
@@ -342,10 +529,11 @@ final class BandwidthTestHelper {
                 BandwidthResult result = new BandwidthResult(download.bps, upload.bps, download.bytes, download.ms, upload.ms, ok, message);
                 result.exitIp = exitIp;
                 result.exitCountry = exitCountry;
+                result.countryProvenance = countryProvenance;
                 return result;
             } catch (Exception e) {
                 Log.e(TAG, "Bandwidth measurement failed", e);
-                return new BandwidthResult(-1, -1, -1, -1, -1, false, e.getMessage());
+                return new BandwidthResult(-1, -1, -1, -1, -1, false, sanitizeError(e.getMessage()));
             } finally {
                 if (controller != null) {
                     try {
@@ -537,31 +725,109 @@ final class BandwidthTestHelper {
         }
     }
 
-    private static BandwidthSample measureHttpDelay(
+    static String sanitizeError(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return "Unknown error";
+        }
+        String sanitized = message;
+        sanitized = sanitized.replaceAll("(?i)(vless|vmess|trojan|ss|ssr|hysteria|hysteria2|tuic)://[^\\s]+", "[REDACTED_URI]");
+        sanitized = sanitized.replaceAll("(?i)://[^:@/\\s]+:[^@/\\s]+@", "://[REDACTED_AUTH]@");
+        sanitized = sanitized.replaceAll("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "[REDACTED_UUID]");
+        sanitized = sanitized.replaceAll("\\?[^\\s]+", "");
+        return sanitized.trim();
+    }
+
+    static String sanitizeUrl(String rawUrl) {
+        if (rawUrl == null) return "";
+        try {
+            URL u = new URL(rawUrl);
+            int port = u.getPort();
+            String portPart = (port > 0 && port != u.getDefaultPort()) ? ":" + port : "";
+            return u.getProtocol() + "://" + u.getHost() + portPart + u.getPath();
+        } catch (Exception e) {
+            return rawUrl.replaceAll("\\?[^\\s]+", "").replaceAll("://[^@]+@", "://");
+        }
+    }
+
+    static String extractHost(String rawUrl) {
+        if (rawUrl == null) return "unknown";
+        try {
+            URL u = new URL(rawUrl);
+            return u.getHost() != null ? u.getHost() : "unknown";
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    static String determineTier(String rawUrl) {
+        if (rawUrl == null) return "standard";
+        String lower = rawUrl.toLowerCase(Locale.US);
+        if (lower.contains("youtube.com") || lower.contains("googlevideo.com")) {
+            return "video";
+        }
+        if (lower.contains("facebook.com") || lower.contains("instagram.com") || lower.contains("cdninstagram.com")) {
+            return "social";
+        }
+        if (lower.contains("google.com") || lower.contains("gstatic.com")) {
+            return "web";
+        }
+        if (lower.contains("cloudflare.com") || lower.contains("cachefly.net")) {
+            return "cdn";
+        }
+        return "standard";
+    }
+
+    private static ProbeResult probeTarget(
             Proxy proxy,
             String rawUrl,
             int timeoutMs,
             int attempts
-    ) throws IOException {
-        URL target = requireHttpsTarget(rawUrl, "delay");
-        int port = target.getPort() > 0 ? target.getPort() : 443;
+    ) {
+        String cleanUrl = sanitizeUrl(rawUrl);
+        String host = extractHost(rawUrl);
+        String tier = determineTier(rawUrl);
+        URL target;
+        int port;
+        try {
+            target = requireHttpsTarget(rawUrl, "delay");
+            host = target.getHost();
+            port = target.getPort() > 0 ? target.getPort() : 443;
+        } catch (Exception e) {
+            TargetEvidence ev = new TargetEvidence(
+                    cleanUrl,
+                    host,
+                    false,
+                    -1,
+                    -1,
+                    0,
+                    sanitizeError(e.getMessage()),
+                    System.currentTimeMillis(),
+                    tier,
+                    false
+            );
+            return new ProbeResult(null, ev);
+        }
+
         int sampleCount = Math.max(1, Math.min(3, attempts));
         int requiredSamples = (sampleCount + 1) / 2;
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         long coldStarted = System.nanoTime();
         long coldMs = -1;
         Socket plain = new Socket(proxy);
-        trackSocket(plain);
+        int lastStatusCode = -1;
+        String failureError = null;
+
         try {
+            trackSocket(plain);
             plain.connect(
-                    InetSocketAddress.createUnresolved(target.getHost(), port),
+                    InetSocketAddress.createUnresolved(host, port),
                     remainingTimeoutMs(deadlineNanos)
             );
             plain.setSoTimeout(remainingTimeoutMs(deadlineNanos));
 
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
-            try (SSLSocket socket = (SSLSocket) factory.createSocket(plain, target.getHost(), port, true)) {
-                configureTlsSocket(socket, target.getHost(), remainingTimeoutMs(deadlineNanos));
+            try (SSLSocket socket = (SSLSocket) factory.createSocket(plain, host, port, true)) {
+                configureTlsSocket(socket, host, remainingTimeoutMs(deadlineNanos));
                 socket.startHandshake();
 
                 InputStream in = socket.getInputStream();
@@ -582,7 +848,9 @@ final class BandwidthTestHelper {
                         HttpResponseHead response = readResponseHead(in);
                         long responseAt = System.nanoTime();
                         if (coldMs < 0) coldMs = TimeUnit.NANOSECONDS.toMillis(responseAt - coldStarted);
+                        lastStatusCode = response.statusCode;
                         if (!isDelayResponseStatus(response.statusCode)) {
+                            failureError = "HTTP " + response.statusCode;
                             throw new IOException("Delay probe failed with HTTP " + response.statusCode);
                         }
                         bytesRead += drainDelayResponseBody(in, response);
@@ -593,23 +861,72 @@ final class BandwidthTestHelper {
                         if (response.connectionClose) break;
                     } catch (IOException e) {
                         if (samples.size() >= requiredSamples) break;
+                        if (failureError == null) {
+                            failureError = sanitizeError(e.getMessage());
+                        }
                         throw e;
                     }
                 }
 
                 if (samples.size() < requiredSamples) {
-                    throw new IOException("Not enough valid real-delay samples");
+                    if (failureError == null) failureError = "Not enough valid real-delay samples";
+                    throw new IOException(failureError);
                 }
                 Collections.sort(samples);
                 long medianMs = samples.get(samples.size() / 2);
                 BandwidthSample result = new BandwidthSample(-1, bytesRead, medianMs);
                 result.coldMs = coldMs;
                 result.jitterMs = samples.get(samples.size() - 1) - samples.get(0);
-                return result;
+
+                TargetEvidence ev = new TargetEvidence(
+                        cleanUrl,
+                        host,
+                        true,
+                        lastStatusCode > 0 ? lastStatusCode : 200,
+                        medianMs,
+                        bytesRead,
+                        null,
+                        System.currentTimeMillis(),
+                        tier,
+                        false
+                );
+                return new ProbeResult(result, ev);
             }
+        } catch (Exception e) {
+            if (failureError == null) {
+                failureError = sanitizeError(e.getMessage());
+            }
+            TargetEvidence ev = new TargetEvidence(
+                    cleanUrl,
+                    host,
+                    false,
+                    lastStatusCode,
+                    -1,
+                    0,
+                    failureError,
+                    System.currentTimeMillis(),
+                    tier,
+                    false
+            );
+            return new ProbeResult(null, ev);
         } finally {
-            if (!plain.isClosed()) plain.close();
+            if (!plain.isClosed()) {
+                try { plain.close(); } catch (Exception ignored) {}
+            }
         }
+    }
+
+    static BandwidthSample measureHttpDelay(
+            Proxy proxy,
+            String rawUrl,
+            int timeoutMs,
+            int attempts
+    ) throws IOException {
+        ProbeResult pr = probeTarget(proxy, rawUrl, timeoutMs, attempts);
+        if (pr.sample != null) {
+            return pr.sample;
+        }
+        throw new IOException(pr.evidence != null && pr.evidence.error != null ? pr.evidence.error : "Probe failed");
     }
 
     static List<String> collectDelayUrls(JSONObject payload, String fallbackUrl) {
@@ -658,16 +975,11 @@ final class BandwidthTestHelper {
                 }
             }
         }
-        if (!targetDelays.isEmpty()) {
-            List<Long> sorted = new ArrayList<>(targetDelays);
-            Collections.sort(sorted);
-            return sorted.get(sorted.size() / 2);
-        }
         return selectWorstDelayMs(targetDelays);
     }
 
     static boolean isDelayResponseStatus(int statusCode) {
-        return (statusCode >= 200 && statusCode < 400) || statusCode == 404;
+        return statusCode >= 200 && statusCode < 300;
     }
 
     private static BandwidthSample measureUpload(Proxy proxy, String url, int bytes, int timeoutMs) throws IOException {

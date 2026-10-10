@@ -303,4 +303,55 @@ public class VpnCoreInstrumentedTest {
                         executor.shutdownNow();
                 }
         }
+
+        @Test
+        public void targetEvidence_serializesToJsonProperly() throws Exception {
+                BandwidthTestHelper.TargetEvidence ev = new BandwidthTestHelper.TargetEvidence(
+                        "https://www.youtube.com/generate_204",
+                        "www.youtube.com",
+                        true,
+                        204,
+                        95L,
+                        0L,
+                        null,
+                        1700000000000L,
+                        "video",
+                        false
+                );
+                JSONObject json = ev.toJson();
+                assertNotNull(json);
+                assertEquals("https://www.youtube.com/generate_204", json.getString("target"));
+                assertEquals("www.youtube.com", json.getString("destination"));
+                assertTrue(json.getBoolean("ok"));
+                assertEquals(204, json.getInt("status"));
+                assertEquals(204, json.getInt("statusCode"));
+                assertEquals(95L, json.getLong("latencyMs"));
+                assertEquals(0L, json.getLong("bytes"));
+                assertEquals(1700000000000L, json.getLong("checkedAt"));
+                assertEquals("video", json.getString("tier"));
+                assertFalse(json.getBoolean("browserVerified"));
+                assertTrue(json.isNull("error"));
+        }
+
+        @Test
+        public void targetEvidence_serializesErrorProperly() throws Exception {
+                BandwidthTestHelper.TargetEvidence ev = new BandwidthTestHelper.TargetEvidence(
+                        "https://www.google.com/generate_204",
+                        "www.google.com",
+                        false,
+                        500,
+                        -1L,
+                        0L,
+                        "HTTP 500",
+                        1700000000000L,
+                        "web",
+                        false
+                );
+                JSONObject json = ev.toJson();
+                assertNotNull(json);
+                assertFalse(json.getBoolean("ok"));
+                assertEquals(500, json.getInt("status"));
+                assertEquals(500, json.getInt("statusCode"));
+                assertEquals("HTTP 500", json.getString("error"));
+        }
 }

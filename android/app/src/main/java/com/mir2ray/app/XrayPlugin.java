@@ -1106,6 +1106,13 @@ public class XrayPlugin extends Plugin {
                     if (preferredTestUrl != null && !preferredTestUrl.trim().isEmpty()) {
                         payload.put("preferredDelayUrl", preferredTestUrl.trim());
                     }
+                    JSArray requiredTargets = call.getArray("requiredTargets");
+                    if (requiredTargets != null && requiredTargets.length() > 0) {
+                        payload.put("requiredTargets", requiredTargets);
+                    }
+                    if (call.hasOption("requireExitIp")) {
+                        payload.put("requireExitIp", call.getBoolean("requireExitIp", false));
+                    }
                     payload.put("timeoutMs", timeoutMs);
 
                     java.util.concurrent.CompletableFuture<BandwidthTestHelper.BandwidthResult> future =
@@ -1155,6 +1162,32 @@ public class XrayPlugin extends Plugin {
                         if (result != null && result.exitCountry != null && !result.exitCountry.isEmpty()) {
                             ret.put("exitCountry", result.exitCountry);
                         }
+                        if (result != null && result.countryProvenance != null && !result.countryProvenance.isEmpty()) {
+                            ret.put("countryProvenance", result.countryProvenance);
+                        }
+                        JSArray evidenceArray = new JSArray();
+                        if (result != null && result.targetEvidence != null) {
+                            for (BandwidthTestHelper.TargetEvidence ev : result.targetEvidence) {
+                                JSObject evObj = new JSObject();
+                                evObj.put("target", ev.target);
+                                evObj.put("destination", ev.destination);
+                                evObj.put("ok", ev.ok);
+                                evObj.put("status", ev.status);
+                                evObj.put("statusCode", ev.statusCode);
+                                evObj.put("latencyMs", ev.latencyMs);
+                                evObj.put("bytes", ev.bytes);
+                                if (ev.error != null) {
+                                    evObj.put("error", ev.error);
+                                } else {
+                                    evObj.put("error", JSONObject.NULL);
+                                }
+                                evObj.put("checkedAt", ev.checkedAt);
+                                evObj.put("tier", ev.tier);
+                                evObj.put("browserVerified", ev.browserVerified);
+                                evidenceArray.put(evObj);
+                            }
+                        }
+                        ret.put("targetEvidence", evidenceArray);
                         android.app.Activity act = getActivity();
                         if (act != null) {
                             act.runOnUiThread(() -> pcall.resolve(ret));
@@ -1168,6 +1201,7 @@ public class XrayPlugin extends Plugin {
                     ret.put("latency", -1);
                     ret.put("worstLatency", -1);
                     ret.put("ok", false);
+                    ret.put("targetEvidence", new JSArray());
                     android.app.Activity act = getActivity();
                     if (act != null) {
                         act.runOnUiThread(() -> pcall.resolve(ret));
@@ -1181,12 +1215,14 @@ public class XrayPlugin extends Plugin {
             ret.put("latency", -1);
             ret.put("worstLatency", -1);
             ret.put("ok", false);
+            ret.put("targetEvidence", new JSArray());
             pcall.reject("Too many pending tests in queue, please wait and try again");
         } catch (Exception e) {
             JSObject ret = new JSObject();
             ret.put("latency", -1);
             ret.put("worstLatency", -1);
             ret.put("ok", false);
+            ret.put("targetEvidence", new JSArray());
             pcall.reject("Failed to queue measure test: " + e.getMessage());
         }
     }
@@ -1208,6 +1244,15 @@ public class XrayPlugin extends Plugin {
                     ret.put("ok", result.ok);
                     if (result.message != null) {
                         ret.put("message", result.message);
+                    }
+                    if (result.exitIp != null && !result.exitIp.isEmpty()) {
+                        ret.put("exitIp", result.exitIp);
+                    }
+                    if (result.exitCountry != null && !result.exitCountry.isEmpty()) {
+                        ret.put("exitCountry", result.exitCountry);
+                    }
+                    if (result.countryProvenance != null && !result.countryProvenance.isEmpty()) {
+                        ret.put("countryProvenance", result.countryProvenance);
                     }
                     android.app.Activity act = getActivity();
                     if (act != null) {
@@ -1250,6 +1295,15 @@ public class XrayPlugin extends Plugin {
                     ret.put("ok", result.ok);
                     if (result.message != null) {
                         ret.put("message", result.message);
+                    }
+                    if (result.exitIp != null && !result.exitIp.isEmpty()) {
+                        ret.put("exitIp", result.exitIp);
+                    }
+                    if (result.exitCountry != null && !result.exitCountry.isEmpty()) {
+                        ret.put("exitCountry", result.exitCountry);
+                    }
+                    if (result.countryProvenance != null && !result.countryProvenance.isEmpty()) {
+                        ret.put("countryProvenance", result.countryProvenance);
                     }
                     android.app.Activity act = getActivity();
                     if (act != null) {

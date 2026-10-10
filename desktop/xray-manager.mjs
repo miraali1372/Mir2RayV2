@@ -6,8 +6,9 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { buildMainConfig, buildSpeedTestConfig } from './xray-config.mjs';
 import {
-  downloadWithResolvedIp, fetchPublicIp, fetchPublicIpThroughHttpProxy, getFreePort, measureHttpsDelayThroughHttpProxy,
-  requestThroughHttpProxy, uploadThroughHttpProxy, uploadWithResolvedIp,
+  downloadWithResolvedIp, evaluateAggregateDelay, fetchPublicIp, fetchPublicIpThroughHttpProxy, getFreePort,
+  isUsablePublicIp, measureHttpsDelayThroughHttpProxy, probeMultipleTargets, probeTargetEvidence,
+  requestThroughHttpProxy, sanitizeLog, uploadThroughHttpProxy, uploadWithResolvedIp,
   resolveWithDns, selectPreferredDelaySample, selectSlowestDelaySample, tcpPing, waitForPort,
 } from './net-utils.mjs';
 
@@ -36,14 +37,6 @@ class Semaphore {
     try { return await task(); }
     finally { this.active -= 1; this.queue.shift()?.(); }
   }
-}
-
-function sanitizeLog(value) {
-  return String(value || '')
-    .replace(/(?:vless|vmess|trojan|ss):\/\/\S+/gi, '[config]')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]')
-    .replace(/[A-F0-9]{8}(?:-[A-F0-9]{4}){3}-[A-F0-9]{12}/gi, '[id]')
-    .slice(0, 2000);
 }
 
 function remainingDeadlineMs(deadline, label) {
@@ -428,57 +421,63 @@ export class XrayManager {
           try { return new URL(value).protocol === 'https:'; }
           catch { return false; }
         })
-        .slice(0, 3);
+        .slice(0, 5);
       if (urls.length === 0) throw new Error('No valid real-delay target was provided');
       const preferredUrl = String(options?.preferredTestUrl || '').trim();
       const samples = await this.runTemporaryCore(payload, async port => {
         const deadline = Date.now() + timeoutMs;
-        const orderedUrls = preferredUrl && urls.includes(preferredUrl)
-          ? [preferredUrl, ...urls.filter(url => url !== preferredUrl)]
-          : urls;
-        let delaySample = null;
-        for (let index = 0; index < orderedUrls.length; index += 1) {
-          const remaining = deadline - Date.now();
-          if (remaining < 500) break;
-          const targetsLeft = orderedUrls.length - index;
-          const targetBudget = Math.min(
-            remaining,
-            Math.max(1000, Math.floor(remaining / targetsLeft))
-          );
-          const target = orderedUrls[index];
-          try {
-            delaySample = {
-              ...await measureHttpsDelayThroughHttpProxy(port, target, {
-                timeoutMs: targetBudget,
-                attempts: 1,
-              }),
-              target,
-            };
-            break;
-          } catch {
-            // Try the next service target within the same overall deadline.
-          }
-        }
-        if (!delaySample) throw new Error('All real-delay targets failed');
+        const targetResults = await probeMultipleTargets(port, urls, {
+          timeoutMs: Math.max(2000, timeoutMs - 1500),
+          deadline: deadline - 1500,
+          preferredUrl,
+          parallel: Boolean(options?.parallel),
+        });
 
         let exitIp = null;
+        let exitCountry = null;
         const remaining = deadline - Date.now();
         if (remaining >= 500) {
-          const result = await fetchPublicIpThroughHttpProxy(port, Math.min(1000, remaining));
-          if (result.ok) exitIp = result.ip;
+          const result = await fetchPublicIpThroughHttpProxy(port, Math.min(2500, remaining));
+          if (result.ok && isUsablePublicIp(result.ip)) {
+            exitIp = result.ip;
+            exitCountry = result.country || null;
+          }
         }
-        return { preferred: delaySample, slowest: delaySample, exitIp };
+        return { targetResults, exitIp, exitCountry };
       });
-      const ok = samples.preferred.ok
-        && samples.slowest.ok
-        && (maxLatencyMs < 0 || samples.slowest.elapsed <= maxLatencyMs);
+
+      const aggregate = evaluateAggregateDelay(samples.targetResults, {
+        preferredTestUrl: preferredUrl,
+        requiredTestUrls: options?.requiredTestUrls || options?.requiredUrls,
+        maxLatencyMs,
+        strictAggregate: options?.strictAggregate !== false,
+      });
+
       return {
-        latency: samples.preferred.elapsed,
-        worstLatency: samples.slowest.elapsed,
-        ok,
+        latency: aggregate.latency,
+        worstLatency: aggregate.worstLatency,
+        coldLatency: aggregate.coldLatency,
+        jitter: aggregate.jitter,
+        ok: aggregate.ok,
         exitIp: samples.exitIp || null,
+        exitCountry: samples.exitCountry || null,
+        targets: samples.targetResults,
+        targetResults: samples.targetResults,
       };
-    } catch { return { latency: -1, worstLatency: -1, ok: false }; }
+    } catch (error) {
+      return {
+        latency: -1,
+        worstLatency: -1,
+        coldLatency: -1,
+        jitter: -1,
+        ok: false,
+        exitIp: null,
+        exitCountry: null,
+        targets: [],
+        targetResults: [],
+        message: sanitizeLog(error instanceof Error ? error.message : error),
+      };
+    }
   }
 
   async measureConfigDownload(options) {
@@ -490,20 +489,33 @@ export class XrayManager {
       );
       const timeoutMs = Math.max(1000, Number(payload.timeoutMs || options?.timeoutMs || 8000));
       const sample = await this.runTemporaryCore(payload, async port => {
-        const exitIp = await fetchPublicIpThroughHttpProxy(
+        const exitIpRes = await fetchPublicIpThroughHttpProxy(
           port,
           Math.min(4500, Math.max(1500, Math.floor(timeoutMs / 3)))
         );
-        if (!exitIp.ok) throw new Error('Exit IP validation failed');
-        return requestThroughHttpProxy(port, payload.downloadUrl || options?.downloadUrl || DEFAULT_DOWNLOAD_TEST_URL, {
+        if (!exitIpRes.ok || !isUsablePublicIp(exitIpRes.ip)) throw new Error('Exit IP validation failed');
+        const transfer = await requestThroughHttpProxy(port, payload.downloadUrl || options?.downloadUrl || DEFAULT_DOWNLOAD_TEST_URL, {
           timeoutMs,
           maxBytes: bytes,
         });
+        return {
+          ...transfer,
+          exitIp: exitIpRes.ip,
+          exitCountry: exitIpRes.country || null,
+        };
       }, this.bandwidthTests);
       const ok = sample.ok && sample.bytes >= Math.max(1, bytes * 0.9);
-      return { downloadBps: ok ? sample.bps : -1, downloadBytes: sample.bytes, downloadMs: sample.elapsed, ok, message: ok ? undefined : 'Downloaded too few bytes' };
+      return {
+        downloadBps: ok ? sample.bps : -1,
+        downloadBytes: sample.bytes,
+        downloadMs: sample.elapsed,
+        ok,
+        exitIp: sample.exitIp || null,
+        exitCountry: sample.exitCountry || null,
+        message: ok ? undefined : 'Downloaded too few bytes',
+      };
     } catch (error) {
-      return { downloadBps: -1, downloadBytes: -1, downloadMs: -1, ok: false, message: sanitizeLog(error instanceof Error ? error.message : error) };
+      return { downloadBps: -1, downloadBytes: -1, downloadMs: -1, ok: false, exitIp: null, exitCountry: null, message: sanitizeLog(error instanceof Error ? error.message : error) };
     }
   }
 
@@ -521,11 +533,11 @@ export class XrayManager {
       const timeoutMs = Math.max(1000, Number(payload.timeoutMs || options?.timeoutMs || 8000));
       const samples = await this.runTemporaryCore(payload, async port => {
         const deadline = Date.now() + (timeoutMs * 2);
-        const exitIp = await fetchPublicIpThroughHttpProxy(
+        const exitIpRes = await fetchPublicIpThroughHttpProxy(
           port,
           Math.min(4500, Math.max(1500, Math.floor(timeoutMs / 3)))
         );
-        if (!exitIp.ok) throw new Error('Exit IP validation failed');
+        if (!exitIpRes.ok || !isUsablePublicIp(exitIpRes.ip)) throw new Error('Exit IP validation failed');
         const download = await requestThroughHttpProxy(
           port,
           payload.downloadUrl || options?.downloadUrl || DEFAULT_DOWNLOAD_TEST_URL,
@@ -552,7 +564,12 @@ export class XrayManager {
           }
         );
         if (!upload.ok) throw new Error(upload.message || 'Upload test failed');
-        return { download, upload };
+        return {
+          download,
+          upload,
+          exitIp: exitIpRes.ip,
+          exitCountry: exitIpRes.country || null,
+        };
       }, this.bandwidthTests);
 
       return {
@@ -562,6 +579,8 @@ export class XrayManager {
         downloadMs: samples.download.elapsed,
         uploadMs: samples.upload.elapsed,
         ok: samples.download.bps > 0 && samples.upload.bps > 0,
+        exitIp: samples.exitIp || null,
+        exitCountry: samples.exitCountry || null,
       };
     } catch (error) {
       return {
@@ -571,6 +590,8 @@ export class XrayManager {
         downloadMs: -1,
         uploadMs: -1,
         ok: false,
+        exitIp: null,
+        exitCountry: null,
         message: sanitizeLog(error instanceof Error ? error.message : error),
       };
     }
@@ -578,7 +599,12 @@ export class XrayManager {
 
   async getCurrentPublicIp(options) {
     const result = await fetchPublicIp(options?.timeoutMs || 7000);
-    return { ...result, source: this.mainProcess ? 'vpn' : 'direct' };
+    const valid = result.ok && isUsablePublicIp(result.ip);
+    return {
+      ...result,
+      source: this.mainProcess ? 'vpn' : 'direct',
+      country: valid ? (result.country || undefined) : undefined,
+    };
   }
 
   async getTrafficStats() {

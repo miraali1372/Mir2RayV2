@@ -567,7 +567,7 @@ async function openProxyTlsTunnel(proxyPort, url, timeoutMs, rejectUnauthorized)
   });
 }
 
-function requestDelaySample(agent, url, timeoutMs, startedAt) {
+function requestDelaySample(agent, url, timeoutMs, startedAt, options = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const request = https.request({
@@ -590,14 +590,35 @@ function requestDelaySample(agent, url, timeoutMs, startedAt) {
       const responseStartedAt = performance.now();
       const statusCode = Number(response.statusCode || 0);
       const ok = isDelayResponseStatus(statusCode);
+      const maxBodyBytes = Math.max(0, Number(options.maxBodyBytes ?? 1024));
+      let bodyBytes = 0;
+      const bodyChunks = [];
+      response.on('data', chunk => {
+        if (bodyBytes < maxBodyBytes) {
+          const remaining = maxBodyBytes - bodyBytes;
+          bodyChunks.push(chunk.subarray(0, remaining));
+        }
+        bodyBytes += chunk.length;
+      });
       response.once('error', error => finish(error));
       response.resume();
       response.once('end', () => {
-        finish(ok ? null : new Error(`HTTP ${statusCode}`), {
+        const bodySnippet = Buffer.concat(bodyChunks).toString('utf8').slice(0, 256);
+        const sample = {
           ok,
           statusCode,
           elapsed: Math.max(1, Math.round(responseStartedAt - startedAt)),
-        });
+          bytes: bodyBytes,
+          body: bodySnippet,
+        };
+        if (ok) {
+          finish(null, sample);
+        } else {
+          const err = new Error(`HTTP ${statusCode}`);
+          err.statusCode = statusCode;
+          err.sample = sample;
+          finish(err, sample);
+        }
       });
     });
     const timer = setTimeout(() => request.destroy(new Error('Proxy delay request timeout')), timeoutMs);
@@ -646,8 +667,16 @@ export function selectPreferredDelaySample(samples, preferredTarget) {
     sample?.ok
     && Number.isFinite(sample.elapsed)
     && sample.elapsed >= 0
-    && sample.target === normalizedTarget
+    && (sample.target === normalizedTarget || sample.destination === normalizedTarget || sample.url === normalizedTarget)
   )) ?? null;
+}
+
+export function sanitizeLog(value) {
+  return String(value || '')
+    .replace(/(?:vless|vmess|trojan|ss|hysteria2?|tuic|wireguard|socks5?):\/\/\S+/gi, '[config]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]')
+    .replace(/[A-F0-9]{8}(?:-[A-F0-9]{4}){3}-[A-F0-9]{12}/gi, '[id]')
+    .slice(0, 2000);
 }
 
 /**
@@ -659,14 +688,14 @@ export async function measureHttpsDelayThroughHttpProxy(proxyPort, rawUrl, optio
   const url = new URL(rawUrl);
   if (url.protocol !== 'https:') throw new Error('Only HTTPS probes are supported');
 
-  const timeoutMs = Math.max(2000, Number(options.timeoutMs || 8000));
+  const timeoutMs = Math.max(500, Number(options.timeoutMs || 8000));
   const attempts = Math.max(1, Math.min(3, Number(options.attempts || 3)));
   const rejectUnauthorized = options.rejectUnauthorized !== false;
   const deadline = Date.now() + timeoutMs;
   const secure = await openProxyTlsTunnel(
     proxyPort,
     url,
-    Math.max(1000, deadline - Date.now()),
+    Math.max(250, deadline - Date.now()),
     rejectUnauthorized
   );
   const agent = new https.Agent({ keepAlive: true, maxSockets: 1, maxFreeSockets: 1 });
@@ -678,6 +707,7 @@ export async function measureHttpsDelayThroughHttpProxy(proxyPort, rawUrl, optio
   };
   const samples = [];
   const failures = [];
+  let lastFailureError = null;
   try {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const remaining = deadline - Date.now();
@@ -689,9 +719,11 @@ export async function measureHttpsDelayThroughHttpProxy(proxyPort, rawUrl, optio
           agent,
           url,
           attemptTimeout,
-          performance.now()
+          performance.now(),
+          options
         ));
       } catch (error) {
+        lastFailureError = error;
         failures.push(error instanceof Error ? error.message : 'Unknown probe failure');
         if (secure.destroyed) break;
       }
@@ -703,7 +735,10 @@ export async function measureHttpsDelayThroughHttpProxy(proxyPort, rawUrl, optio
 
   if (samples.length < Math.ceil(attempts / 2)) {
     const reason = failures.find(Boolean) || 'No response';
-    throw new Error(`Real-delay probe received ${samples.length}/${attempts} valid responses: ${reason}`);
+    const err = new Error(`Real-delay probe received ${samples.length}/${attempts} valid responses: ${reason}`);
+    if (lastFailureError?.sample) err.sample = lastFailureError.sample;
+    if (lastFailureError?.statusCode) err.statusCode = lastFailureError.statusCode;
+    throw err;
   }
   const representative = selectMedianDelaySample(samples);
   if (!representative) throw new Error('Real-delay probe did not receive a valid response');
@@ -711,6 +746,262 @@ export async function measureHttpsDelayThroughHttpProxy(proxyPort, rawUrl, optio
     ...representative,
     attempts: samples.length,
     samples: samples.map(sample => sample.elapsed),
+  };
+}
+
+/**
+ * Probes a single target endpoint and constructs a normalized evidence record.
+ */
+export async function probeTargetEvidence(proxyPort, rawUrl, options = {}) {
+  const target = String(rawUrl || '').trim();
+  const checkedAt = Date.now();
+  let destination = target;
+  let tier = 'general';
+  try {
+    const parsed = new URL(target);
+    destination = parsed.hostname;
+    if (/youtube\.com|google\.com|gstatic\.com|facebook\.com|instagram\.com|fbcdn\.net/i.test(parsed.hostname)) {
+      tier = 'tier1';
+    } else if (/cloudflare\.com|fastly\.net|cachefly\.net/i.test(parsed.hostname)) {
+      tier = 'tier2';
+    }
+  } catch {
+    // Keep raw target if invalid URL
+  }
+
+  try {
+    const url = new URL(target);
+    if (url.protocol !== 'https:') {
+      throw new Error('Only HTTPS probes are supported');
+    }
+    const sample = await measureHttpsDelayThroughHttpProxy(proxyPort, target, options);
+    const latencyMs = Number.isFinite(sample.elapsed) && sample.elapsed >= 0 ? sample.elapsed : -1;
+    const statusCode = Number(sample.statusCode || 0);
+    const ok = Boolean(sample.ok && latencyMs >= 0);
+    const browserVerified = Boolean(
+      ok && (statusCode === 204 || (statusCode >= 200 && statusCode < 400)) && latencyMs > 0
+    );
+
+    return {
+      target,
+      destination,
+      url: target,
+      ok,
+      status: statusCode,
+      statusCode,
+      latencyMs,
+      elapsed: latencyMs,
+      latency: latencyMs,
+      bytes: Number(sample.bytes || 0),
+      body: typeof sample.body === 'string' ? sample.body.slice(0, 256) : '',
+      error: ok ? null : (sample.message || `HTTP ${statusCode}`),
+      message: ok ? null : (sample.message || `HTTP ${statusCode}`),
+      checkedAt,
+      tier,
+      browserVerified,
+      attempts: sample.attempts || 1,
+      samples: sample.samples || [latencyMs],
+    };
+  } catch (err) {
+    const errorMsg = sanitizeLog(err instanceof Error ? err.message : String(err)).slice(0, 200);
+    const statusCode = Number(err?.statusCode || err?.sample?.statusCode || 0);
+    const bytes = Number(err?.sample?.bytes || 0);
+    const body = typeof err?.sample?.body === 'string' ? err.sample.body.slice(0, 256) : '';
+    const elapsed = Number.isFinite(err?.sample?.elapsed) ? err.sample.elapsed : -1;
+    return {
+      target,
+      destination,
+      url: target,
+      ok: false,
+      status: statusCode,
+      statusCode,
+      latencyMs: -1,
+      elapsed: -1,
+      latency: -1,
+      bytes,
+      body,
+      error: errorMsg,
+      message: errorMsg,
+      checkedAt,
+      tier,
+      browserVerified: false,
+      attempts: 0,
+      samples: elapsed >= 0 ? [elapsed] : [],
+    };
+  }
+}
+
+/**
+ * Probes multiple target endpoints and collects per-target evidence records.
+ */
+export async function probeMultipleTargets(proxyPort, targetUrls, options = {}) {
+  const urls = [...new Set(
+    (Array.isArray(targetUrls) ? targetUrls : [targetUrls])
+      .map(u => String(u || '').trim())
+      .filter(Boolean)
+  )].filter(value => {
+    try { return new URL(value).protocol === 'https:'; }
+    catch { return false; }
+  }).slice(0, 5);
+
+  if (urls.length === 0) return [];
+
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || 8000));
+  const deadline = options.deadline || (Date.now() + timeoutMs);
+
+  if (options.parallel) {
+    const remaining = Math.max(500, deadline - Date.now());
+    return Promise.all(
+      urls.map(target => probeTargetEvidence(proxyPort, target, {
+        ...options,
+        timeoutMs: Math.min(options.targetTimeoutMs || timeoutMs, remaining),
+        attempts: options.attempts || 1,
+      }))
+    );
+  }
+
+  const results = [];
+  for (let i = 0; i < urls.length; i += 1) {
+    const remaining = deadline - Date.now();
+    const target = urls[i];
+    if (remaining < 250) {
+      const hostname = (() => { try { return new URL(target).hostname; } catch { return target; } })();
+      results.push({
+        target,
+        destination: hostname,
+        url: target,
+        ok: false,
+        status: 0,
+        statusCode: 0,
+        latencyMs: -1,
+        elapsed: -1,
+        latency: -1,
+        bytes: 0,
+        body: '',
+        error: 'Probe deadline exceeded',
+        message: 'Probe deadline exceeded',
+        checkedAt: Date.now(),
+        tier: /youtube|google|facebook|instagram/i.test(hostname) ? 'tier1' : 'general',
+        browserVerified: false,
+        attempts: 0,
+        samples: [],
+      });
+      continue;
+    }
+    const targetsLeft = urls.length - i;
+    const targetBudget = Math.min(
+      remaining,
+      Math.max(1000, Math.floor(remaining / targetsLeft))
+    );
+    const result = await probeTargetEvidence(proxyPort, target, {
+      ...options,
+      timeoutMs: targetBudget,
+      attempts: options.attempts || 1,
+    });
+    results.push(result);
+  }
+
+  return results;
+}
+
+/**
+ * Evaluates aggregate delay across probed targets with strict required-target success semantics.
+ */
+export function evaluateAggregateDelay(targetResults, options = {}) {
+  const results = Array.isArray(targetResults) ? targetResults : [];
+  if (results.length === 0) {
+    return {
+      latency: -1,
+      worstLatency: -1,
+      bestLatency: -1,
+      coldLatency: -1,
+      jitter: -1,
+      ok: false,
+      allPassed: false,
+      requiredPassed: false,
+      passedCount: 0,
+      totalCount: 0,
+    };
+  }
+
+  const successful = results.filter(r => (
+    r && r.ok && Number.isFinite(r.latencyMs) && r.latencyMs >= 0
+  ));
+
+  const explicitRequired = options.requiredTestUrls || options.requiredUrls || options.requiredTargets;
+  let requiredUrls;
+  if (Array.isArray(explicitRequired) && explicitRequired.length > 0) {
+    requiredUrls = new Set(explicitRequired.map(u => String(u || '').trim()).filter(Boolean));
+  } else if (options.strictAggregate !== false) {
+    requiredUrls = new Set(results.map(r => r.target));
+  } else {
+    requiredUrls = new Set();
+  }
+
+  const requiredPassed = requiredUrls.size === 0
+    ? successful.length > 0
+    : Array.from(requiredUrls).every(reqTarget => {
+        const match = results.find(r => (
+          r.target === reqTarget || r.url === reqTarget || r.destination === reqTarget
+        ));
+        return Boolean(match?.ok);
+      });
+
+  const allPassed = results.length > 0 && results.every(r => r.ok);
+
+  const preferredTarget = String(options.preferredTestUrl || options.preferredUrl || '').trim();
+  let preferredSample = null;
+  if (preferredTarget) {
+    preferredSample = successful.find(r => (
+      r.target === preferredTarget || r.url === preferredTarget || r.destination === preferredTarget
+    ));
+  }
+  if (!preferredSample && successful.length > 0) {
+    const sorted = [...successful].sort((a, b) => a.latencyMs - b.latencyMs);
+    preferredSample = sorted[Math.floor(sorted.length / 2)];
+  }
+
+  let slowestSample = null;
+  if (successful.length > 0) {
+    slowestSample = successful.reduce((slowest, cur) => (
+      cur.latencyMs > slowest.latencyMs ? cur : slowest
+    ));
+  }
+
+  let fastestSample = null;
+  if (successful.length > 0) {
+    fastestSample = successful.reduce((fastest, cur) => (
+      cur.latencyMs < fastest.latencyMs ? cur : fastest
+    ));
+  }
+
+  const latency = preferredSample ? preferredSample.latencyMs : -1;
+  const worstLatency = slowestSample ? slowestSample.latencyMs : -1;
+  const bestLatency = fastestSample ? fastestSample.latencyMs : -1;
+  const jitter = (worstLatency >= 0 && bestLatency >= 0) ? (worstLatency - bestLatency) : -1;
+  const coldLatency = Number.isFinite(results[0]?.latencyMs) ? results[0].latencyMs : -1;
+
+  const maxLatencyMs = Number(options.maxLatencyMs || -1);
+  const latencyUnderLimit = maxLatencyMs <= 0 || (worstLatency >= 0 && worstLatency <= maxLatencyMs);
+
+  const isStrict = options.strictAggregate !== false;
+  const ok = Boolean(
+    successful.length > 0
+    && (isStrict ? requiredPassed : true)
+    && latencyUnderLimit
+  );
+
+  return {
+    latency,
+    worstLatency,
+    bestLatency,
+    coldLatency,
+    jitter,
+    ok,
+    allPassed,
+    requiredPassed,
+    passedCount: successful.length,
+    totalCount: results.length,
   };
 }
 
@@ -734,6 +1025,35 @@ export function parsePublicIpBody(body) {
   for (const line of trimmed.split(/\r?\n/)) {
     const candidate = line.startsWith('ip=') ? line.slice(3).trim() : line.trim();
     if (net.isIP(candidate)) return candidate;
+  }
+  return '';
+}
+
+export function parsePublicCountryBody(body) {
+  const trimmed = String(body || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const candidate = parsed.country_code || parsed.countryCode || parsed.country || parsed.loc;
+      if (typeof candidate === 'string') {
+        const code = candidate.trim().toUpperCase();
+        if (/^[A-Z]{2}$/.test(code)) return code;
+      }
+    } catch {
+      // Fall through to line-based parsing
+    }
+  }
+  for (const line of trimmed.split(/\r?\n/)) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.startsWith('loc=')) {
+      const code = trimmedLine.slice(4).trim().toUpperCase();
+      if (/^[A-Z]{2}$/.test(code)) return code;
+    }
+    if (trimmedLine.startsWith('country=')) {
+      const code = trimmedLine.slice(8).trim().toUpperCase();
+      if (/^[A-Z]{2}$/.test(code)) return code;
+    }
   }
   return '';
 }
@@ -798,7 +1118,12 @@ export async function fetchPublicIpThroughHttpProxy(proxyPort, timeoutMs = 4500,
         continue;
       }
       const ip = parsePublicIpBody(response.body);
-      if (isUsablePublicIp(ip)) return { ok: true, ip };
+      if (isUsablePublicIp(ip)) {
+        const country = parsePublicCountryBody(response.body);
+        const result = { ok: true, ip };
+        if (country) result.country = country;
+        return result;
+      }
       lastMessage = 'Exit IP endpoint returned an invalid or local address';
     } catch (error) {
       lastMessage = error instanceof Error ? error.message : 'Exit IP endpoint failed';
@@ -838,8 +1163,14 @@ export async function fetchPublicIp(timeoutMs = 7000, options = {}) {
         lastMessage = `IP endpoint returned HTTP ${response.status}`;
         continue;
       }
-      const ip = parsePublicIpBody(await response.text());
-      if (isUsablePublicIp(ip)) return { ok: true, ip };
+      const text = await response.text();
+      const ip = parsePublicIpBody(text);
+      if (isUsablePublicIp(ip)) {
+        const country = parsePublicCountryBody(text);
+        const result = { ok: true, ip };
+        if (country) result.country = country;
+        return result;
+      }
       lastMessage = 'IP endpoint returned an invalid response';
     } catch (error) {
       lastMessage = error instanceof Error ? error.message : 'IP endpoint failed';
